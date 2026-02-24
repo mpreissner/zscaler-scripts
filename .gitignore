@@ -1,0 +1,11 @@
+# Config files with live secrets (keep .example templates)
+*.conf
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Logs
+*.log

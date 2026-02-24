@@ -1,0 +1,17 @@
+# ZPA OneAPI Configuration
+# Based on Postman collection variables
+
+# ZIdentity URL - for OAuth authentication
+# This is where you get your access token
+export ZIDENTITY_BASE_URL="https://<vanity-url>.zslogin.net"
+
+# OneAPI Base URL - for all API calls
+# Usually https://api.zsapi.net but verify with your Zscaler admin
+export ONEAPI_BASE_URL="https://api.zsapi.net"
+
+# OAuth Client Credentials (created in ZIdentity)
+export ZPA_CLIENT_ID="your_client_id_here"
+export ZPA_CLIENT_SECRET="your_client_secret_here"
+
+# ZPA Customer ID
+export ZPA_CUSTOMER_ID="your_customer_id_here"
