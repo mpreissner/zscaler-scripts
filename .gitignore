@@ -9,3 +9,6 @@ __pycache__/
 
 # Logs
 *.log
+
+# Claude
+.claude
