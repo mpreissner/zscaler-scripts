@@ -148,29 +148,23 @@ class ZPAOneAPIClient:
             self._log(f"✓ Deleted certificate ID: {cert_id}")
             return True
         else:
-            self._log(f"✗ Failed to delete certificate {cert_id}: {response.status_code}")
+            self._log(f"✗ Failed to delete certificate {cert_id}: {response.status_code} - {response.text}")
             return False
     
     def get_browser_access_apps(self):
         """Get all Browser Access application segments"""
-        url = f"{self.base_url}/application/getAppsByType"
-        params = {"applicationType": "BROWSER_ACCESS"}
-        
+        url = f"{self.base_url}/application"
+        params = {"applicationType": "BROWSER_ACCESS", "page": 1, "pagesize": 500}
+
         self._log("Fetching Browser Access applications...")
         response = requests.get(url, headers=self._get_headers(), params=params)
         response.raise_for_status()
-        
+
         response_data = response.json()
         all_apps = response_data.get('list', [])
-        
-        ba_apps = []
-        for app in all_apps:
-            clientless_apps = app.get('clientlessApps', [])
-            if clientless_apps and len(clientless_apps) > 0:
-                ba_apps.append(app)
-        
-        self._log(f"Found {len(ba_apps)} Browser Access applications")
-        return ba_apps
+
+        self._log(f"Found {len(all_apps)} Browser Access application segments")
+        return all_apps
     
     def get_application(self, app_id):
         """Get specific application details"""
@@ -198,7 +192,7 @@ class ZPAOneAPIClient:
         response = requests.get(url, headers=self._get_headers())
         response.raise_for_status()
         
-        portals = response.json()
+        portals = response.json().get('list', [])
         self._log(f"Found {len(portals)} PRA Portals")
         return portals
     
@@ -274,7 +268,11 @@ def main():
         
         for app in all_apps:
             clientless_apps = app.get('clientlessApps', [])
-            
+            if not clientless_apps:
+                # List response may omit clientlessApps detail; fetch full app to check domains
+                full_app = client.get_application(app['id'])
+                clientless_apps = full_app.get('clientlessApps', [])
+
             app_matches = False
             for ca in clientless_apps:
                 domain = ca.get('domain', '')
@@ -342,7 +340,9 @@ def main():
             client._log(f"=== Certificate update completed (no resources updated) ===\n")
             return
         
-        client._log("\n--- Checking for old certificates to clean up ---")
+        client._log("\nWaiting for portal updates to propagate before cleanup...")
+        time.sleep(5)
+        client._log("--- Checking for old certificates to clean up ---")
         
         certs_deleted = 0
         certs_skipped = 0
