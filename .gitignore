@@ -12,3 +12,6 @@ __pycache__/
 
 # Claude
 .claude
+
+# Mempalace
+mempalace.yaml

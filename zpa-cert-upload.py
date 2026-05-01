@@ -214,29 +214,67 @@ class ZPAOneAPIClient:
             self._log(f"✗ Failed to update PRA portal {portal_id}: {response.status_code} - {response.text}")
             response.raise_for_status()
     
+    def get_user_portals(self):
+        """Get all User Portals"""
+        url = f"{self.base_url}/userPortal"
+
+        self._log("Fetching User Portals...")
+        response = requests.get(url, headers=self._get_headers())
+        response.raise_for_status()
+
+        portals = response.json().get('list', [])
+        self._log(f"Found {len(portals)} User Portals")
+        return portals
+
+    def get_user_portal(self, portal_id):
+        """Get specific User Portal details"""
+        url = f"{self.base_url}/userPortal/{portal_id}"
+        response = requests.get(url, headers=self._get_headers())
+        response.raise_for_status()
+        return response.json()
+
+    def update_user_portal(self, portal_id, portal_config):
+        """Update User Portal configuration"""
+        url = f"{self.base_url}/userPortal/{portal_id}"
+        response = requests.put(url, headers=self._get_headers(), json=portal_config)
+
+        if response.status_code == 204:
+            return True
+        else:
+            self._log(f"✗ Failed to update User Portal {portal_id}: {response.status_code} - {response.text}")
+            response.raise_for_status()
+
     def is_certificate_in_use(self, cert_id, exclude_resources=None):
         """Check if a certificate is being used by any resource"""
         if exclude_resources is None:
-            exclude_resources = {'apps': set(), 'pra_portals': set()}
-        
+            exclude_resources = {'apps': set(), 'pra_portals': set(), 'user_portals': set()}
+
         all_apps = self.get_browser_access_apps()
         for app in all_apps:
             if app['id'] in exclude_resources.get('apps', set()):
                 continue
-            
+
             clientless_apps = app.get('clientlessApps', [])
             for ca in clientless_apps:
                 if ca.get('certificateId') == cert_id:
                     return True, 'app', app
-        
+
         pra_portals = self.get_pra_portals()
         for portal in pra_portals:
             if portal['id'] in exclude_resources.get('pra_portals', set()):
                 continue
-            
+
             if portal.get('certificateId') == cert_id:
                 return True, 'pra_portal', portal
-        
+
+        user_portals = self.get_user_portals()
+        for portal in user_portals:
+            if portal['id'] in exclude_resources.get('user_portals', set()):
+                continue
+
+            if portal.get('certificateId') == cert_id:
+                return True, 'user_portal', portal
+
         return False, None, None
 
 def main():
@@ -261,7 +299,7 @@ def main():
         domain_base = DOMAIN.replace('*.', '')
         
         old_cert_ids = set()
-        updated_resources = {'apps': set(), 'pra_portals': set()}
+        updated_resources = {'apps': set(), 'pra_portals': set(), 'user_portals': set()}
         
         client._log(f"\n--- Processing Browser Access Applications ---")
         all_apps = client.get_browser_access_apps()
@@ -330,10 +368,36 @@ def main():
                 updated_resources['pra_portals'].add(portal['id'])
                 time.sleep(0.5)
         
-        total_updated = len(updated_resources['apps']) + len(updated_resources['pra_portals'])
+        client._log(f"\n--- Processing User Portals ---")
+        user_portals = client.get_user_portals()
+
+        for portal in user_portals:
+            if not portal.get('certificateId'):
+                continue
+
+            domain = portal.get('address', '')
+            domain_check = domain.replace('*.', '')
+
+            if domain_check == domain_base or domain_check.endswith('.' + domain_base):
+                client._log(f"  Found User Portal: {portal['name']} (ID: {portal['id']})")
+
+                old_cert_id = portal.get('certificateId')
+                if old_cert_id:
+                    old_cert_ids.add(old_cert_id)
+
+                portal_config = client.get_user_portal(portal['id'])
+                portal_config['certificateId'] = new_cert_id
+
+                client.update_user_portal(portal['id'], portal_config)
+                client._log(f"  ✓ User Portal updated from cert {old_cert_id} to {new_cert_id}")
+                updated_resources['user_portals'].add(portal['id'])
+                time.sleep(0.5)
+
+        total_updated = len(updated_resources['apps']) + len(updated_resources['pra_portals']) + len(updated_resources['user_portals'])
         client._log(f"\n✓ Successfully updated {total_updated} resources:")
         client._log(f"  - Browser Access Apps: {len(updated_resources['apps'])}")
         client._log(f"  - PRA Portals: {len(updated_resources['pra_portals'])}")
+        client._log(f"  - User Portals: {len(updated_resources['user_portals'])}")
         
         if total_updated == 0:
             client._log("WARNING: No matching resources found! Certificate uploaded but not assigned.")
