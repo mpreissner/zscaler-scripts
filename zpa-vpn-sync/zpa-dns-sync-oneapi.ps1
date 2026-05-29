@@ -275,7 +275,7 @@ function Sync-DNSRecords {
                     $updated++
                 }
                 else {
-                    Write-Log "VERIFY  $label.$DnsZone already $ip (state cache was stale)"
+                    Write-Log "VERIFY  $label.$DnsZone already $ip — no update needed"
                 }
             }
             else {
