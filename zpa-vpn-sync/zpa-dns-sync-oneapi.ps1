@@ -1,4 +1,4 @@
-﻿#Requires -Modules DnsServer
+﻿# #Requires -Modules DnsServer  # Windows only — uncomment when deploying to Windows Server
 
 # =============================================================================
 # zpa-dns-sync-oneapi.ps1
@@ -228,7 +228,7 @@ function Sync-DNSRecords {
     $vpnMap = @{}
     foreach ($user in $VpnUsers) {
         $hostname = $user.hostname
-        $ip       = $user.ipAddress
+        $ip       = $user.clientIpAddress
         if ([string]::IsNullOrWhiteSpace($hostname) -or [string]::IsNullOrWhiteSpace($ip)) {
             Write-Log "Skipping entry with missing hostname or IP (user: $($user.userName))" "WARN"
             continue
