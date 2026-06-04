@@ -16,9 +16,9 @@ Tom O'Leary, Mike Preissner
 ## Requirements
 
 - PowerShell 5.1 or later
-- `DnsServer` module — included on Windows Server with the DNS role, or installable via RSAT on a domain member: `Add-WindowsCapability -Online -Name Rsat.Dns.Tools~~~~0.0.1.0`
+- `DnsServer` module — included on Windows Server with the DNS role, or installable via RSAT on a domain member: `Add-WindowsCapability -Online -Name Rsat.Dns.Tools~~~~0.0.1.0` for Desktops and `Install-WindowsFeature -Name RSAT-DNS-Server` on Server platforms
 - A service account with full CRUD delegation on the target DNS zone (not Domain Admin — standard DNS zone permissions are sufficient)
-- ZPA OneAPI credentials with read access to `vpnConnectedUsers` (ZPA > Administration > API Key Management)
+- OneAPI credentials with read access ZPA API resources
 
 ## Setup
 
@@ -43,7 +43,7 @@ powershell.exe -ExecutionPolicy Bypass -File "C:\Scripts\zpa-dns-sync-oneapi.ps1
 
 Settings can be provided two ways — the config file takes precedence over the in-script defaults:
 
-**Recommended: external config file** — copy `zpa-dns-sync.config.json.example` to `zpa-dns-sync.config.json` alongside the script. This file is gitignored so secrets never end up in the repo, and you won't need to re-enter credentials each time the script is updated.
+**Recommended: external config file** — copy `zpa-dns-sync.config.json.example` to `zpa-dns-sync.config.json` alongside the script, and edit to include your values. You won't need to re-enter credentials each time the script is updated.
 
 **Alternative: edit the script directly** — fill in the `USER CONFIGURATION` block at the top of `zpa-dns-sync-oneapi.ps1`. Use single quotes for `$ClientId` and `$ClientSecret` to prevent PowerShell from interpreting any `$` or backtick characters in the values.
 
