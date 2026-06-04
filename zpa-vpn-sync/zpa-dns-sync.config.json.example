@@ -1,0 +1,12 @@
+{
+    "ClientId":     "YOUR_CLIENT_ID_HERE",
+    "ClientSecret": "YOUR_CLIENT_SECRET_HERE",
+    "VanityDomain": "yourcompany",
+    "CustomerId":   "YOUR_CUSTOMER_ID_HERE",
+    "DnsZone":      "vpn.corp.local",
+    "DnsServer":    "dc01.corp.local",
+    "RecordTtl":    300,
+    "LogFile":      "C:\\Logs\\zpa-vpn-sync\\zpa-vpn-sync.log",
+    "StateFile":    "C:\\ProgramData\\zpa-vpn-sync\\managed-hosts.json",
+    "PageSize":     500
+}

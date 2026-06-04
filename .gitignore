@@ -1,5 +1,6 @@
 # Config files with live secrets (keep .example templates)
 *.conf
+*.config.json
 
 # Python
 __pycache__/

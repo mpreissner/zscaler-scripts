@@ -11,6 +11,7 @@ Tom O'Leary, Mike Preissner
 | File | Purpose |
 |------|---------|
 | `zpa-dns-sync-oneapi.ps1` | Core sync script. Authenticates to ZPA via OneAPI (OAuth2 client_credentials), fetches all connected VPN users with pagination, and adds or updates A records in the target AD DNS zone. A local state cache avoids redundant DNS operations for entries that haven't changed. |
+| `zpa-dns-sync.config.json.example` | Template for the optional external config file — copy to `zpa-dns-sync.config.json` alongside the script and fill in your values. |
 
 ## Requirements
 
@@ -21,7 +22,7 @@ Tom O'Leary, Mike Preissner
 
 ## Setup
 
-1. Open `zpa-dns-sync-oneapi.ps1` and fill in the **USER CONFIGURATION** section at the top
+1. Copy `zpa-dns-sync.config.json.example` to `zpa-dns-sync.config.json` in the same directory as the script and fill in your values (see [Configuration](#configuration) below). Alternatively, edit the **USER CONFIGURATION** block directly at the top of the script.
 2. Create the scheduled task (run once as a local admin — the task itself runs as the service account):
 
 ```powershell
@@ -32,11 +33,19 @@ $principal = New-ScheduledTaskPrincipal -UserId "CORP\svc-zpavpndns" -LogonType 
 Register-ScheduledTask -TaskName "ZPA VPN DNS Sync" -Action $action -Trigger $trigger -Principal $principal
 ```
 
-3. Run the task manually once to verify connectivity and inspect the log before relying on the schedule
+3. Run the task manually once to verify connectivity and inspect the log before relying on the schedule:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File "C:\Scripts\zpa-dns-sync-oneapi.ps1"
+```
 
 ## Configuration
 
-All settings live in the `USER CONFIGURATION` block at the top of the script — no external config file is required.
+Settings can be provided two ways — the config file takes precedence over the in-script defaults:
+
+**Recommended: external config file** — copy `zpa-dns-sync.config.json.example` to `zpa-dns-sync.config.json` alongside the script. This file is gitignored so secrets never end up in the repo, and you won't need to re-enter credentials each time the script is updated.
+
+**Alternative: edit the script directly** — fill in the `USER CONFIGURATION` block at the top of `zpa-dns-sync-oneapi.ps1`. Use single quotes for `$ClientId` and `$ClientSecret` to prevent PowerShell from interpreting any `$` or backtick characters in the values.
 
 | Variable | Description |
 |----------|-------------|

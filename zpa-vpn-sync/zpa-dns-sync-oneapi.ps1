@@ -57,6 +57,28 @@ $StateFile    = "C:\ProgramData\zpa-vpn-sync\managed-hosts.json"
 $PageSize     = 500
 
 # =============================================================================
+# CONFIG FILE (optional) — overrides the defaults above
+# Copy zpa-dns-sync.config.json.example -> zpa-dns-sync.config.json alongside
+# this script on the target machine and fill in your values. The config file
+# is gitignored so secrets stay off the repo.
+# =============================================================================
+$_cfgPath = Join-Path $PSScriptRoot "zpa-dns-sync.config.json"
+if (Test-Path $_cfgPath) {
+    $cfg = Get-Content $_cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($cfg.ClientId)     { $ClientId     = [string]$cfg.ClientId }
+    if ($cfg.ClientSecret) { $ClientSecret = [string]$cfg.ClientSecret }
+    if ($cfg.VanityDomain) { $VanityDomain = [string]$cfg.VanityDomain }
+    if ($cfg.CustomerId)   { $CustomerId   = [string]$cfg.CustomerId }
+    if ($cfg.DnsZone)      { $DnsZone      = [string]$cfg.DnsZone }
+    if ($cfg.DnsServer)    { $DnsServer    = [string]$cfg.DnsServer }
+    if ($cfg.RecordTtl)    { $RecordTtl    = [int]$cfg.RecordTtl }
+    if ($cfg.LogFile)      { $LogFile      = [string]$cfg.LogFile }
+    if ($cfg.StateFile)    { $StateFile    = [string]$cfg.StateFile }
+    if ($cfg.PageSize)     { $PageSize     = [int]$cfg.PageSize }
+    Remove-Variable cfg, _cfgPath
+}
+
+# =============================================================================
 # SCRIPT INTERNALS — no changes needed below this line
 # =============================================================================
 
@@ -111,8 +133,8 @@ function Get-ZPAToken {
             -Body $body -ContentType "application/x-www-form-urlencoded"
     }
     catch {
-        $statusCode = $_.Exception.Response.StatusCode.value__
-        $body       = $_.ErrorDetails.Message
+        $statusCode = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 'N/A' }
+        $body       = if ($_.ErrorDetails)        { $_.ErrorDetails.Message }               else { $_.Exception.Message }
         Write-Log "Token request failed (HTTP $statusCode): $body" "ERROR"
         throw
     }
