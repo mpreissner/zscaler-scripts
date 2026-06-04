@@ -1,4 +1,4 @@
-#Requires -Modules DnsServer
+﻿#Requires -Modules DnsServer
 
 # =============================================================================
 # zpa-dns-sync-oneapi.ps1
