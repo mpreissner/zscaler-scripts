@@ -1,4 +1,4 @@
-﻿# #Requires -Modules DnsServer  # Windows only — uncomment when deploying to Windows Server
+﻿#Requires -Modules DnsServer
 
 # =============================================================================
 # zpa-dns-sync-oneapi.ps1
