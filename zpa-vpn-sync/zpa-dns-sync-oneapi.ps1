@@ -111,7 +111,9 @@ function Get-ZPAToken {
             -Body $body -ContentType "application/x-www-form-urlencoded"
     }
     catch {
-        Write-Log "Token request failed: $_" "ERROR"
+        $statusCode = $_.Exception.Response.StatusCode.value__
+        $body       = $_.ErrorDetails.Message
+        Write-Log "Token request failed (HTTP $statusCode): $body" "ERROR"
         throw
     }
     $script:AccessToken = $resp.access_token
