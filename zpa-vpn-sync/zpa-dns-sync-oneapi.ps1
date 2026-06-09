@@ -268,12 +268,29 @@ function Sync-DNSRecords {
 
     # Snapshot existing A records only for the labels we need to act on
     Write-Log "Querying zone '${DnsZone}' on ${DnsServer}..."
+
+    # Pre-flight: verify WinRM is reachable before attempting DNS cmdlet
+    try {
+        Test-WSMan -ComputerName $DnsServer -ErrorAction Stop | Out-Null
+        Write-Log "WinRM reachable on ${DnsServer}"
+    }
+    catch {
+        Write-Log "WinRM pre-flight failed for ${DnsServer}: $_" "WARN"
+    }
+
     try {
         $existing = Get-DnsServerResourceRecord `
             -ZoneName $DnsZone -RRType A -ComputerName $DnsServer -ErrorAction SilentlyContinue
     }
     catch {
         Write-Log "Failed to query DNS zone: $_" "ERROR"
+        Write-Log "  Exception type : $($_.Exception.GetType().FullName)" "ERROR"
+        if ($_.Exception.InnerException) {
+            Write-Log "  Inner exception: $($_.Exception.InnerException.Message)" "ERROR"
+            if ($_.Exception.InnerException.InnerException) {
+                Write-Log "  Root cause     : $($_.Exception.InnerException.InnerException.Message)" "ERROR"
+            }
+        }
         throw
     }
     $existingMap = @{}
