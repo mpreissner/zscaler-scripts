@@ -12,6 +12,8 @@ Tom O'Leary, Mike Preissner
 |------|---------|
 | `zpa-dns-sync-oneapi.ps1` | Core sync script. Authenticates to ZPA via OneAPI (OAuth2 client_credentials), fetches all connected VPN users with pagination, and adds or updates A records in the target AD DNS zone. A local state cache avoids redundant DNS operations for entries that haven't changed. |
 | `zpa-dns-sync.config.json.example` | Template for the optional external config file — copy to `zpa-dns-sync.config.json` alongside the script and fill in your values. |
+| `ZVPN-ConProf.ps1` | Powershell script to reclassify the "Zscaler Tunnel" adapter as a Private network interface for less restrictive host firewall. |
+| `ZVPN-SchedTaskConfig.txt` | Instructions for deploying a Scheduled Task via Group Policy Objects to run ZVPN-ConProf.ps1 on detection of Zscaler Tunnel Up in Windows Event Log. |
 
 ## Requirements
 
@@ -20,7 +22,7 @@ Tom O'Leary, Mike Preissner
 - A service account with full CRUD delegation on the target DNS zone (not Domain Admin — standard DNS zone permissions are sufficient)
 - OneAPI credentials with read access ZPA API resources
 
-## Setup
+## Setup - DNS Sync
 
 1. Copy `zpa-dns-sync.config.json.example` to `zpa-dns-sync.config.json` in the same directory as the script and fill in your values (see [Configuration](#configuration) below). Alternatively, edit the **USER CONFIGURATION** block directly at the top of the script.
 2. Create the scheduled task (run once as a local admin — the task itself runs as the service account):
@@ -71,3 +73,14 @@ Settings can be provided two ways — the config file takes precedence over the 
 ## Logs
 
 Activity is written to `$LogFile` and echoed to stdout. Each entry is timestamped and tagged `[INFO]`, `[WARN]`, or `[ERROR]`. The state cache at `$StateFile` is a JSON object mapping hostname labels to their last-synced IP.
+
+## Setup - ZVPN Network Connection Profile Update
+
+1. Host the ZVPN-ConProf.ps1 file on a network share.
+2. Use GPO to create a Scheduled Task on all clients per the instructions in ZVPN-SchedTaskConfig.txt.
+
+## How it works
+
+1. Group Policy Object deploys the script to each client machine and creates scheduled task.
+2. Scheduled Task triggers on Event ID 10000 in the Microsoft-Windows-NetworkProfile/Operational log, with source NetworkProfile.
+3. Script enumerates network interfaces with Alias "Zscaler Tunnel", checks the Network Profile assigned to the interface, and changes it to "Private" if necessary.
