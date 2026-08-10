@@ -3,6 +3,13 @@ The "Zscaler Tunnel" adapter created by VPN for Legacy Apps can sometimes be cla
 with the ZVPN-ConProf.ps1 script allow the endpoint to automatically ensure the adapter gets classified
 as a "Private" network connection, with which Windows Firewall is more permissive (allows certain incoming connections).
 
+The same script can optionally register the tunnel's IP address in AD DNS using Windows' built-in
+dynamic update mechanism, so the record is owned by the computer account and the machine can update it
+itself when it returns on-prem.  That job is off by default -- set $EnableDnsRegistration and
+$DnsServerAddress in the script's USER CONFIGURATION block to enable it.  See README.md for details.
+
+Configure the script's USER CONFIGURATION block BEFORE copying it to the file share.
+
 Store the ZVPN-ConProf.ps1 file on a universally accessible file share such as \\yourdomain.com\SYSVOL\yourdomain.com\scripts\ZVPN-ConProf.ps1
 
 Create a GPO per the following. These can be deployed together in a single GPO or as separate GPOs
@@ -23,6 +30,9 @@ Name: ZVPN Network Connection Profile config
 Run whether user is logged on or not
 Run with highest privileges
 User account: SYSTEM # (or NT AUTHORITY\SYSTEM)
+                     # Required.  Set-NetConnectionProfile and Set-DnsClientServerAddress both need elevation,
+                     # and running as SYSTEM means the dynamic DNS update is made under the computer account,
+                     # which is what gives the machine ownership of its own record under secure dynamic update.
 
 Trigger Tab
 Begin the task: On an event
@@ -45,7 +55,10 @@ Settings Tab
 Check "Allow Task to be run on demand"
 Check "Run task as soon as possible after a scheduled start is missed"
 Uncheck "If the task fails, restart every:"
-Check "Stop the task if it runs longer than:" and set to 1 hour # Script should exit in under 1 second so not likely to ever fire
+Check "Stop the task if it runs longer than:" and set to 1 hour # Script normally exits in a few seconds. Worst case is
+                                                               # $AdapterTimeoutSeconds + $VerifyTimeoutSeconds (default
+                                                               # 60 + 30 = 90s) when the adapter never becomes addressable
+                                                               # or the DNS update does not land, so 1 hour is ample.
 Check "If the running task does not end when requested, force it to stop
 Uncheck "If the task is not scheduled to run again, delete it after:"
 Set "If the task is already running, then the following rule applies:" to "Do not start a new instance"

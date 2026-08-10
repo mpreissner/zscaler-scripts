@@ -12,7 +12,7 @@ Tom O'Leary, Mike Preissner
 |------|---------|
 | `zpa-dns-sync-oneapi.ps1` | Core sync script. Authenticates to ZPA via OneAPI (OAuth2 client_credentials), fetches all connected VPN users with pagination, and adds or updates A records in the target AD DNS zone. A local state cache avoids redundant DNS operations for entries that haven't changed. |
 | `zpa-dns-sync.config.json.example` | Template for the optional external config file — copy to `zpa-dns-sync.config.json` alongside the script and fill in your values. |
-| `ZVPN-ConProf.ps1` | Powershell script to reclassify the "Zscaler Tunnel" adapter as a Private network interface for less restrictive host firewall. |
+| `ZVPN-ConProf.ps1` | Client-side script, GPO-deployed. Reclassifies the "Zscaler Tunnel" adapter as a Private network interface for a less restrictive host firewall, and optionally registers the tunnel IP in AD DNS using Windows' built-in dynamic update. |
 | `ZVPN-SchedTaskConfig.txt` | Instructions for deploying a Scheduled Task via Group Policy Objects to run ZVPN-ConProf.ps1 on detection of Zscaler Tunnel Up in Windows Event Log. |
 
 ## Requirements
@@ -96,11 +96,58 @@ Activity is written to `$LogFile` and echoed to stdout. Each entry is timestampe
 
 ## Setup - ZVPN Network Connection Profile Update
 
-1. Host the ZVPN-ConProf.ps1 file on a network share.
-2. Use GPO to create a Scheduled Task on all clients per the instructions in ZVPN-SchedTaskConfig.txt.
+`ZVPN-ConProf.ps1` runs on the client when the Zscaler Tunnel adapter comes up and performs two independent jobs, each separately switchable at the top of the script:
+
+| Job | Setting | Default |
+|-----|---------|---------|
+| Reclassify the tunnel adapter as a Private network | `$EnableProfileReclassification` | `$true` |
+| Register the tunnel IP in AD DNS via Windows dynamic update | `$EnableDnsRegistration` | `$false` |
+
+1. Edit the **USER CONFIGURATION** block at the top of `ZVPN-ConProf.ps1` — at minimum set `$DnsServerAddress` and `$DnsSuffix` if you are enabling DNS registration.
+2. Host the file on a network share.
+3. Use GPO to create a Scheduled Task on all clients per the instructions in `ZVPN-SchedTaskConfig.txt`.
+
+### Client configuration
+
+| Variable | Description |
+|----------|-------------|
+| `$TargetAlias` | Interface alias of the VPN adapter (default: `Zscaler Tunnel`) |
+| `$EnableProfileReclassification` | Flip the adapter's network category to Private |
+| `$EnableDnsRegistration` | Register the tunnel IP in AD DNS |
+| `$DnsServerAddress` | Internal DNS server that will accept the dynamic update — **required** when DNS registration is enabled |
+| `$DnsSuffix` | Connection-specific suffix to register under. Empty = the machine's primary domain suffix |
+| `$AdapterTimeoutSeconds` | How long to wait for the adapter to obtain a usable IPv4 address (default: `60`) |
+| `$PollIntervalSeconds` | Poll interval while waiting (default: `2`) |
+| `$VerifyRegistration` | Confirm the record landed before releasing the adapter (default: `$true`) |
+| `$VerifyTimeoutSeconds` | How long to wait for the record to appear (default: `30`) |
+| `$PostRegisterDelaySeconds` | Settle delay used instead of verification when `$VerifyRegistration` is `$false` |
+| `$LogFile` | Activity log (default: `C:\ProgramData\zpa-vpn-sync\zvpn-conprof.log`) |
 
 ## How it works
 
-1. Group Policy Object deploys the script to each client machine and creates scheduled task.
+1. Group Policy Object deploys the script to each client machine and creates the scheduled task.
 2. Scheduled Task triggers on Event ID 10000 in the Microsoft-Windows-NetworkProfile/Operational log, with source NetworkProfile.
-3. Script enumerates network interfaces with Alias "Zscaler Tunnel", checks the Network Profile assigned to the interface, and changes it to "Private" if necessary.
+3. The script waits for the "Zscaler Tunnel" adapter to hold a usable IPv4 address. Event 10000 fires when the network profile is evaluated, which can beat the adapter actually being addressable, so it polls rather than assumes. APIPA (`169.254.x.x`) and non-`Preferred` addresses do not count.
+4. It checks the network profile assigned to the interface and changes it to Private if necessary.
+5. If DNS registration is enabled, it registers the tunnel address (see below).
+
+### Dynamic DNS registration
+
+The tunnel adapter comes up with no DNS servers and no connection-specific suffix of its own. `Register-DnsClient` has no way to be pointed at a particular server — the resolver chooses one by interface metric, which off-net is typically the user's home router or their ISP. Neither will accept or forward the update. The script therefore:
+
+1. Applies `$DnsServerAddress` to the tunnel adapter, so the SOA lookup and the update itself go through the tunnel.
+2. Sets `RegisterThisConnectionsAddress` (and the connection-specific suffix, if `$DnsSuffix` is set).
+3. Calls `Register-DnsClient`.
+4. Polls the DNS server until the record resolves to the tunnel IP.
+5. Removes the DNS server from the adapter again.
+
+Step 5 always runs, including when an earlier step throws — leaving an internal DNS server pinned to the tunnel adapter would affect all name resolution on the machine once the tunnel drops. Step 4 deliberately runs *before* step 5: `Register-DnsClient` hands the update to the DNS Client service and returns immediately, so releasing the adapter too early can cut the update off before it is sent.
+
+`$DnsServerAddress` must be reachable through the tunnel — publish it as a ZPA application segment, or the update never leaves the machine.
+
+**Why register client-side at all.** Records written by `zpa-dns-sync-oneapi.ps1` are static and owned by its service account, which is what blocks an on-prem client from updating them (see [Deleting records](#deleting-records)). A record the client registers itself is owned by the computer account, so the machine can update it on its own when it returns on-net. If you run both mechanisms, point `$DnsSuffix` at the same zone as the server script's `$DnsZone`.
+
+**Known limitations.**
+
+- `Register-DnsClient` is machine-wide. It triggers registration for every adapter with registration enabled, not just the tunnel. There is no per-adapter variant.
+- Because the DNS server is removed from the adapter afterwards, Windows' periodic background re-registration (roughly every 24h) again has no route to the internal DNS server. A long-lived tunnel session could therefore see the record scavenged before the script next runs.
