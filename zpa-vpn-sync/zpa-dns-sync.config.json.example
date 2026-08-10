@@ -8,5 +8,7 @@
     "RecordTtl":    300,
     "LogFile":      "C:\\Logs\\zpa-vpn-sync\\zpa-vpn-sync.log",
     "StateFile":    "C:\\ProgramData\\zpa-vpn-sync\\managed-hosts.json",
-    "PageSize":     500
+    "PageSize":     500,
+    "SyncDeletes":  false,
+    "MaxDeletesPerRun": 50
 }

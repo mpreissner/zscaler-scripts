@@ -5,8 +5,11 @@
 #
 # Retrieves VPN Legacy App connected users from Zscaler ZPA via OneAPI and
 # syncs their hostname-to-IP mappings as A records in an Active Directory DNS
-# zone. Records are only added or updated — never deleted. When a client
-# returns on-net, normal AD DNS registration overwrites the VPN IP naturally.
+# zone. Records are added and updated unconditionally — a client connecting to
+# the VPN overwrites whatever A record it previously registered on-net. When
+# $SyncDeletes is enabled, records are also removed once a host drops off the
+# ZPA connected-user list, so the name is free for the client to reclaim via
+# normal AD dynamic registration.
 #
 # Intended to run as a Windows Scheduled Task under a service account that
 # holds full CRUD delegation for the target DNS zone (DNS Zone permissions,
@@ -56,6 +59,28 @@ $StateFile    = "C:\ProgramData\zpa-vpn-sync\managed-hosts.json"
 # ZPA API page size (1–500). 500 minimises round-trips.
 $PageSize     = 500
 
+# Remove A records for hosts that have dropped off the ZPA connected-user list.
+#
+# Records written by this script are static, and under secure dynamic update a
+# client cannot overwrite a record owned by this script's service account. A
+# host that returns on-prem therefore keeps resolving to its stale VPN IP
+# indefinitely. Deleting the record frees the name so the client's own dynamic
+# registration can reclaim it.
+#
+# A record is only deleted when its current IP still matches what this script
+# last wrote for that host (per $StateFile). If the IP has changed, something
+# else has already taken the name over — most likely the client re-registering
+# after scavenging, or a manual fix — and that value is more current than ours,
+# so the record is left alone. This check applies ONLY to the delete path;
+# adds and updates for a connecting client always overwrite whatever is there.
+$SyncDeletes  = $false
+
+# Safety valve: if a single run would delete more than this many records, all
+# deletes are skipped and logged as an error. Guards against a transient empty
+# or partial ZPA response wiping every managed record in the zone. Set to 0 to
+# remove the cap.
+$MaxDeletesPerRun = 50
+
 # =============================================================================
 # CONFIG FILE (optional) — overrides the defaults above
 # Copy zpa-dns-sync.config.json.example -> zpa-dns-sync.config.json alongside
@@ -75,6 +100,10 @@ if (Test-Path $_cfgPath) {
     if ($cfg.LogFile)      { $LogFile      = [string]$cfg.LogFile }
     if ($cfg.StateFile)    { $StateFile    = [string]$cfg.StateFile }
     if ($cfg.PageSize)     { $PageSize     = [int]$cfg.PageSize }
+    # Presence tests, not truthiness — a config value of false or 0 is a
+    # meaningful setting here and must still override the default above.
+    if ($cfg.PSObject.Properties['SyncDeletes'])      { $SyncDeletes      = [bool]$cfg.SyncDeletes }
+    if ($cfg.PSObject.Properties['MaxDeletesPerRun']) { $MaxDeletesPerRun = [int]$cfg.MaxDeletesPerRun }
     Remove-Variable cfg, _cfgPath
 }
 
@@ -258,9 +287,27 @@ function Sync-DNSRecords {
             $toSync[$label] = $vpnMap[$label]
         }
     }
-    Write-Log "$($vpnMap.Count) connected users — $($toSync.Count) to sync, $skipped unchanged"
+    # Hosts present in the previous run but absent from the current connected-user
+    # list have disconnected from the VPN. Their records are the stale static
+    # entries that block on-prem dynamic registration.
+    $toDelete = @{}
+    if ($SyncDeletes) {
+        foreach ($label in $prevState.Keys) {
+            if (-not $vpnMap.ContainsKey($label)) { $toDelete[$label] = $prevState[$label] }
+        }
+        if ($MaxDeletesPerRun -gt 0 -and $toDelete.Count -gt $MaxDeletesPerRun) {
+            Write-Log ("$($toDelete.Count) records queued for deletion exceeds MaxDeletesPerRun " +
+                       "($MaxDeletesPerRun) — skipping ALL deletes this run. If the ZPA response " +
+                       "was genuinely this much smaller, raise the cap or clear the state file.") "ERROR"
+            # Carry the entries forward so a later run can still delete them.
+            foreach ($label in $toDelete.Keys) { $newState[$label] = $toDelete[$label] }
+            $toDelete = @{}
+        }
+    }
 
-    if ($toSync.Count -eq 0) {
+    Write-Log "$($vpnMap.Count) connected users — $($toSync.Count) to sync, $($toDelete.Count) to delete, $skipped unchanged"
+
+    if ($toSync.Count -eq 0 -and $toDelete.Count -eq 0) {
         Write-Log "No DNS changes required."
         if ($newState.Count -ne $prevState.Count) { Write-StateFile -State $newState }
         return
@@ -293,20 +340,36 @@ function Sync-DNSRecords {
         }
         throw
     }
+    # A name can legitimately hold several A records, so map each label to the
+    # full list. The delete path needs this to target one specific record data
+    # rather than wiping every A record sharing the name.
     $existingMap = @{}
     foreach ($rec in $existing) {
-        $existingMap[$rec.HostName.ToLower()] = $rec.RecordData.IPv4Address.ToString()
+        $label = $rec.HostName.ToLower()
+        if (-not $existingMap.ContainsKey($label)) {
+            $existingMap[$label] = [System.Collections.Generic.List[string]]::new()
+        }
+        $existingMap[$label].Add($rec.RecordData.IPv4Address.ToString())
     }
 
     $ttlSpan = [TimeSpan]::FromSeconds($RecordTtl)
-    $added = 0; $updated = 0; $errors = 0
+    $added = 0; $updated = 0; $deleted = 0; $reclaimed = 0; $errors = 0
 
     foreach ($label in $toSync.Keys) {
         $ip = $toSync[$label]
         try {
             if ($existingMap.ContainsKey($label)) {
-                if ($existingMap[$label] -ne $ip) {
-                    Write-Log "UPDATE  $label.$DnsZone : $($existingMap[$label]) -> $ip"
+                $currentIps = $existingMap[$label]
+                # Only a single record already holding the right IP is a no-op.
+                # Anything else — a different IP, or several records for the name —
+                # is replaced. This deliberately overwrites records the script does
+                # not own: a client connecting to the VPN must supersede whatever
+                # address it dynamically registered while it was on-net.
+                if ($currentIps.Count -eq 1 -and $currentIps[0] -eq $ip) {
+                    Write-Log "VERIFY  $label.$DnsZone already $ip — no update needed"
+                }
+                else {
+                    Write-Log "UPDATE  $label.$DnsZone : $($currentIps -join ', ') -> $ip"
                     Remove-DnsServerResourceRecord `
                         -ZoneName $DnsZone -Name $label -RRType A `
                         -ComputerName $DnsServer -Force
@@ -314,9 +377,6 @@ function Sync-DNSRecords {
                         -Name $label -ZoneName $DnsZone -IPv4Address $ip `
                         -TimeToLive $ttlSpan -ComputerName $DnsServer
                     $updated++
-                }
-                else {
-                    Write-Log "VERIFY  $label.$DnsZone already $ip — no update needed"
                 }
             }
             else {
@@ -335,9 +395,39 @@ function Sync-DNSRecords {
         }
     }
 
+    # Remove the stale static records left behind by hosts that have disconnected.
+    # Successfully deleted (and already-absent, and reclaimed) labels are simply
+    # not written back into $newState, so the script stops tracking them.
+    foreach ($label in $toDelete.Keys) {
+        $lastIp = $toDelete[$label]
+        try {
+            if (-not $existingMap.ContainsKey($label)) {
+                Write-Log "GONE    $label.$DnsZone already absent — nothing to delete"
+                continue
+            }
+            if ($existingMap[$label] -notcontains $lastIp) {
+                Write-Log ("KEEP    $label.$DnsZone is now $($existingMap[$label] -join ', '), " +
+                           "not the $lastIp this script wrote — reclaimed elsewhere, leaving it alone")
+                $reclaimed++
+                continue
+            }
+            Write-Log "DELETE  $label.$DnsZone : $lastIp (no longer VPN connected)"
+            Remove-DnsServerResourceRecord `
+                -ZoneName $DnsZone -Name $label -RRType A -RecordData $lastIp `
+                -ComputerName $DnsServer -Force
+            $deleted++
+        }
+        catch {
+            Write-Log "Failed to delete '$label': $_" "ERROR"
+            $errors++
+            # Keep it in state so the next run retries the delete.
+            $newState[$label] = $lastIp
+        }
+    }
+
     Write-StateFile -State $newState
 
-    Write-Log "Sync complete — added: $added  updated: $updated  errors: $errors"
+    Write-Log "Sync complete — added: $added  updated: $updated  deleted: $deleted  reclaimed: $reclaimed  errors: $errors"
     if ($errors -gt 0) {
         Write-Log "$errors DNS operation(s) failed — review log for details" "WARN"
     }
@@ -349,6 +439,7 @@ function Sync-DNSRecords {
 Write-Log "=== ZPA VPN DNS Sync starting ==="
 Write-Log "Customer ID : $CustomerId"
 Write-Log "DNS Zone    : $DnsZone  |  Server: $DnsServer"
+Write-Log ("Deletes     : " + $(if ($SyncDeletes) { "enabled (cap: $(if ($MaxDeletesPerRun -gt 0) { $MaxDeletesPerRun } else { 'none' }) per run)" } else { "disabled" }))
 
 try {
     $vpnUsers = Get-VPNConnectedUsers

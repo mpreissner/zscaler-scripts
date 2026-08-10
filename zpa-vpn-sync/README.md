@@ -1,6 +1,6 @@
 # ZPA VPN DNS Sync
 
-Keeps an Active Directory DNS zone in sync with users currently connected via Zscaler Private Access (ZPA) VPN Legacy Apps. On each run it retrieves the live connected-user list from ZPA via OneAPI and adds or updates A records in the target zone so that on-prem resources can resolve VPN clients by hostname. Records are never deleted — when a client disconnects or returns on-net, normal AD DNS registration overwrites the VPN IP naturally.
+Keeps an Active Directory DNS zone in sync with users currently connected via Zscaler Private Access (ZPA) VPN Legacy Apps. On each run it retrieves the live connected-user list from ZPA via OneAPI and adds or updates A records in the target zone so that on-prem resources can resolve VPN clients by hostname. Optionally (`SyncDeletes`) it also removes records once a host drops off the connected-user list.
 
 ## Authors
 
@@ -61,6 +61,8 @@ Settings can be provided two ways — the config file takes precedence over the 
 | `$LogFile` | Path for the activity log (default: `C:\Logs\zpa-vpn-sync\zpa-vpn-sync.log`) |
 | `$StateFile` | Path for the hostname→IP state cache (default: `C:\ProgramData\zpa-vpn-sync\managed-hosts.json`) |
 | `$PageSize` | ZPA API page size, 1–500 (default: `500`) |
+| `$SyncDeletes` | Remove A records for hosts that are no longer VPN connected (default: `false` — see [Deleting records](#deleting-records)) |
+| `$MaxDeletesPerRun` | Refuse to run if a single pass would delete more than this many records (default: `50`, `0` disables the cap) |
 
 ## How it works
 
@@ -68,7 +70,25 @@ Settings can be provided two ways — the config file takes precedence over the 
 2. Pages through `GET /zpa/mgmtconfig/v1/admin/customers/:customerId/vpnConnectedUsers` until all connected users are retrieved
 3. Compares the result against the state cache from the previous run — entries whose IP hasn't changed are skipped without touching DNS
 4. For new or changed entries, queries the target zone and adds or updates A records accordingly
-5. Writes an updated state cache containing only currently-connected users (disconnected users are pruned from the cache, not from DNS)
+5. If `$SyncDeletes` is enabled, removes records for hosts present in the previous run but absent from the current connected-user list
+6. Writes an updated state cache recording what the script currently owns in the zone
+
+## Deleting records
+
+By default the script only ever adds and updates. That is safe, but it leaves a problem: records written by this script are **static**, and under secure dynamic update a client cannot overwrite a record owned by the script's service account. A machine that disconnects from the VPN and returns on-prem therefore keeps resolving to its stale VPN IP indefinitely — its own dynamic registration is refused. Setting `SyncDeletes` to `true` fixes this by removing the record once the host drops off the ZPA connected-user list, freeing the name for the client to reclaim.
+
+The two directions are deliberately asymmetric:
+
+| Event | Behaviour |
+|-------|-----------|
+| Host **connects** to the VPN | The A record is overwritten unconditionally, including records the script does not own. A client that dynamically registered its LAN address while on-net is superseded by its VPN address. |
+| Host **disconnects** from the VPN | The record is deleted **only if its current IP still matches what the script last wrote** for that host. |
+
+The match test on delete exists because a mismatch means something more current than the script has already taken the name over — most often the client re-registering after the record was scavenged. Deleting in that case would destroy the correct on-prem record, which is the opposite of the intent. Such records are logged as `KEEP … reclaimed elsewhere` and counted as `reclaimed` in the run summary.
+
+`MaxDeletesPerRun` is a blast-radius guard. Because the delete set is derived from the *absence* of hosts in the API response, a transient empty or truncated ZPA reply would otherwise queue every managed record for deletion. If a run exceeds the cap, all deletes are skipped, an `[ERROR]` is logged, and the affected hosts stay in the state cache so a later healthy run can still clean them up.
+
+Enable deletes only once you have run with them off long enough to trust the state cache, and check the log for the first few runs.
 
 ## Logs
 
