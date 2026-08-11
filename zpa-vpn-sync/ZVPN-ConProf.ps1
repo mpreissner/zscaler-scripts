@@ -1,4 +1,4 @@
-# =============================================================================
+﻿# =============================================================================
 # ZVPN-ConProf.ps1
 #
 # Runs on the client when the Zscaler Tunnel adapter comes up. Two independent
@@ -13,7 +13,7 @@
 # Deployed via GPO and triggered by Event ID 10000 in the
 # Microsoft-Windows-NetworkProfile/Operational log. See ZVPN-SchedTaskConfig.txt.
 #
-# Runs as SYSTEM — Set-DnsClientServerAddress and Set-NetConnectionProfile both
+# Runs as SYSTEM - Set-DnsClientServerAddress and Set-NetConnectionProfile both
 # require elevation.
 # =============================================================================
 
@@ -35,7 +35,7 @@ $EnableDnsRegistration = $false
 # $EnableDnsRegistration is $true.
 #
 # The tunnel adapter comes up with no DNS servers of its own, so without this
-# the resolver picks a server by interface metric — off-net that is typically
+# the resolver picks a server by interface metric - off-net that is typically
 # the user's home router or their ISP, which will not accept or forward the
 # update. This address is set on the adapter only for the duration of the
 # registration and removed again afterwards.
@@ -46,7 +46,7 @@ $DnsServerAddress = "10.10.10.10"
 
 # Connection-specific DNS suffix to register the tunnel IP under.
 #
-#   ""                  Register as <hostname>.<primary domain suffix> — the
+#   ""                  Register as <hostname>.<primary domain suffix> - the
 #                       machine's normal AD name. The tunnel IP then competes
 #                       with the LAN A record in the primary zone.
 #   "vpn.corp.local"    Register as <hostname>.vpn.corp.local, keeping VPN
@@ -69,12 +69,12 @@ $VerifyTimeoutSeconds  = 30
 $PostRegisterDelaySeconds = 5
 
 # Activity log (directory is created automatically). Set to "" to log to stdout
-# only — note that a GPO scheduled task running as SYSTEM has nowhere to show
+# only - note that a GPO scheduled task running as SYSTEM has nowhere to show
 # stdout, so a file is strongly recommended.
 $LogFile = "C:\ProgramData\zpa-vpn-sync\zvpn-conprof.log"
 
 # =============================================================================
-# SCRIPT INTERNALS — no changes needed below this line
+# SCRIPT INTERNALS - no changes needed below this line
 # =============================================================================
 
 Set-StrictMode -Version Latest
@@ -130,7 +130,7 @@ function Wait-ForTunnelAddress {
 }
 
 # ---------------------------------------------------------------------------
-# Job 1 — network category
+# Job 1 - network category
 # ---------------------------------------------------------------------------
 function Set-TunnelProfilePrivate {
     $profiles = Get-NetConnectionProfile -ErrorAction SilentlyContinue |
@@ -143,7 +143,7 @@ function Set-TunnelProfilePrivate {
 
     foreach ($connectprofile in $profiles) {
         if ($connectprofile.NetworkCategory -eq "Private") {
-            Write-Log "'$TargetAlias' already classified Private — no change"
+            Write-Log "'$TargetAlias' already classified Private - no change"
             continue
         }
         try {
@@ -157,7 +157,7 @@ function Set-TunnelProfilePrivate {
 }
 
 # ---------------------------------------------------------------------------
-# Job 2 — dynamic DNS registration
+# Job 2 - dynamic DNS registration
 # ---------------------------------------------------------------------------
 # Name the record will be registered under, used only for verification.
 function Get-RegistrationFqdn {
@@ -181,7 +181,7 @@ function Test-RegistrationLanded {
                     return $true
                 }
                 if ($ips.Count -gt 0) {
-                    Write-Log "  $Fqdn currently $($ips -join ', ') — waiting for $ExpectedIp"
+                    Write-Log "  $Fqdn currently $($ips -join ', ') - waiting for $ExpectedIp"
                 }
             }
         }
@@ -197,13 +197,13 @@ function Register-TunnelAddress {
     param([Parameter(Mandatory)][string]$IPAddress)
 
     if ([string]::IsNullOrWhiteSpace($DnsServerAddress)) {
-        Write-Log "DnsRegistration enabled but DnsServerAddress is empty — skipping" "ERROR"
+        Write-Log "DnsRegistration enabled but DnsServerAddress is empty - skipping" "ERROR"
         return
     }
 
     $fqdn = Get-RegistrationFqdn
     if (-not $fqdn) {
-        Write-Log "Could not determine a registration FQDN (machine has no primary DNS suffix and DnsSuffix is unset) — skipping" "ERROR"
+        Write-Log "Could not determine a registration FQDN (machine has no primary DNS suffix and DnsSuffix is unset) - skipping" "ERROR"
         return
     }
 
@@ -230,7 +230,7 @@ function Register-TunnelAddress {
         Register-DnsClient
         Write-Log "  Registration submitted"
 
-        # Verify before the finally block strips the DNS server back off —
+        # Verify before the finally block strips the DNS server back off -
         # Register-DnsClient is asynchronous, and pulling the server address
         # too early can cut the update off before it is sent.
         if ($VerifyRegistration) {
@@ -246,7 +246,7 @@ function Register-TunnelAddress {
         Write-Log "Dynamic DNS registration failed: $_" "ERROR"
     }
     finally {
-        # Always hand the adapter back, even on failure — leaving an internal
+        # Always hand the adapter back, even on failure - leaving an internal
         # DNS server pinned to the tunnel adapter would affect all name
         # resolution on the machine once the tunnel drops.
         try {
@@ -267,16 +267,16 @@ Write-Log "=== ZVPN connection profile script starting (adapter: '$TargetAlias')
 try {
     $tunnelIp = Wait-ForTunnelAddress
     if (-not $tunnelIp) {
-        Write-Log "Adapter '$TargetAlias' had no usable IPv4 address after ${AdapterTimeoutSeconds}s — nothing to do" "WARN"
+        Write-Log "Adapter '$TargetAlias' had no usable IPv4 address after ${AdapterTimeoutSeconds}s - nothing to do" "WARN"
         exit 0
     }
     Write-Log "Adapter '$TargetAlias' has address $tunnelIp"
 
     if ($EnableProfileReclassification) { Set-TunnelProfilePrivate }
-    else { Write-Log "Profile reclassification disabled — skipping" }
+    else { Write-Log "Profile reclassification disabled - skipping" }
 
     if ($EnableDnsRegistration) { Register-TunnelAddress -IPAddress $tunnelIp }
-    else { Write-Log "Dynamic DNS registration disabled — skipping" }
+    else { Write-Log "Dynamic DNS registration disabled - skipping" }
 
     Write-Log "=== ZVPN connection profile script finished ==="
 }
