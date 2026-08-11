@@ -177,6 +177,21 @@ function Write-Log {
 }
 
 # ---------------------------------------------------------------------------
+# Elevation
+# ---------------------------------------------------------------------------
+# Set-NetConnectionProfile and Set-DnsClientServerAddress are both CIM calls
+# that require administrator rights. Without them they fail with "Access to a
+# CIM resource was not available to the client", which says nothing about the
+# actual cause, so check up front and name it. SYSTEM - how the scheduled task
+# runs this - is a member of Administrators, so this passes in normal use and
+# only trips when someone runs the script by hand from an ordinary console.
+function Test-Elevated {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# ---------------------------------------------------------------------------
 # Adapter readiness
 # ---------------------------------------------------------------------------
 # Returns the adapter's usable IPv4 address, or $null if it never appears
@@ -285,11 +300,17 @@ function Register-TunnelAddress {
 
     Write-Log "Registering $fqdn -> $IPAddress via $DnsServerAddress"
 
+    # Only reset an address that was actually applied. If the apply itself
+    # failed there is nothing pinned to the adapter, and resetting anyway just
+    # fails a second time and buries the real error under a follow-on one.
+    $dnsServerApplied = $false
+
     try {
         # The DNS server address is applied to the tunnel adapter only for the
         # duration of the update, so the resolver sends the SOA lookup and the
         # update itself through the tunnel instead of out the physical NIC.
         Set-DnsClientServerAddress -InterfaceAlias $TargetAlias -ServerAddresses $DnsServerAddress
+        $dnsServerApplied = $true
         Write-Log "  Applied DNS server $DnsServerAddress to '$TargetAlias'"
 
         if ($DnsSuffix) {
@@ -322,15 +343,17 @@ function Register-TunnelAddress {
         Write-Log "Dynamic DNS registration failed: $_" "ERROR"
     }
     finally {
-        # Always hand the adapter back, even on failure - leaving an internal
-        # DNS server pinned to the tunnel adapter would affect all name
-        # resolution on the machine once the tunnel drops.
-        try {
-            Set-DnsClientServerAddress -InterfaceAlias $TargetAlias -ResetServerAddresses
-            Write-Log "  Removed DNS server from '$TargetAlias'"
-        }
-        catch {
-            Write-Log "Could not remove DNS server from '$TargetAlias': $_" "ERROR"
+        # Always hand the adapter back once it was taken, even on failure -
+        # leaving an internal DNS server pinned to the tunnel adapter would
+        # affect all name resolution on the machine once the tunnel drops.
+        if ($dnsServerApplied) {
+            try {
+                Set-DnsClientServerAddress -InterfaceAlias $TargetAlias -ResetServerAddresses
+                Write-Log "  Removed DNS server from '$TargetAlias'"
+            }
+            catch {
+                Write-Log "Could not remove DNS server from '$TargetAlias': $_" "ERROR"
+            }
         }
     }
 }
@@ -351,6 +374,15 @@ Write-Log ("Settings: Reclassify=$EnableProfileReclassification DnsRegistration=
            "Poll=${PollIntervalSeconds}s Verify=$VerifyRegistration Timeout=${VerifyTimeoutSeconds}s")
 
 try {
+    # Inside the try so an unexpected failure in the check itself still gets
+    # logged rather than ending the run silently.
+    if (-not (Test-Elevated)) {
+        Write-Log ("Not running elevated - both jobs need administrator rights and would fail with " +
+                   "'Access to a CIM resource was not available to the client'. The GPO scheduled task " +
+                   "runs as SYSTEM; to run this by hand, start PowerShell with 'Run as administrator'.") "ERROR"
+        exit 1
+    }
+
     $tunnelIp = Wait-ForTunnelAddress
     if (-not $tunnelIp) {
         Write-Log "Adapter '$TargetAlias' had no usable IPv4 address after ${AdapterTimeoutSeconds}s - nothing to do" "WARN"

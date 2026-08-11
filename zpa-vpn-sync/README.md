@@ -137,6 +137,19 @@ Config keys and the script variables they override are named identically, minus 
 
 In JSON, write booleans unquoted (`true`, not `"true"`) and escape backslashes in Windows paths (`"C:\\ProgramData\\..."`).
 
+### Running it by hand
+
+Both jobs are CIM calls that require administrator rights. The GPO scheduled task runs as SYSTEM, which satisfies this, but a manual test run from an ordinary console does not — the script checks up front and stops with:
+
+```
+[ERROR] Not running elevated - both jobs need administrator rights and would fail with
+'Access to a CIM resource was not available to the client'. ...
+```
+
+Start PowerShell with **Run as administrator** to test manually. If you see the raw `Access to a CIM resource was not available to the client` error from `Set-NetConnectionProfile` or `Set-DnsClientServerAddress` instead, that is the same cause.
+
+Note that a non-elevated run can still *look* like it partly worked: the reclassification job logs `already classified Private - no change` without attempting a write, so it never hits the permission error.
+
 ## How it works
 
 1. Group Policy Object deploys the script to each client machine and creates the scheduled task.
