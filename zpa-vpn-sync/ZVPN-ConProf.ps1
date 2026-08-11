@@ -78,6 +78,19 @@ $PostRegisterDelaySeconds = 5
 # stdout, so a file is strongly recommended.
 $LogFile = "C:\ProgramData\zpa-vpn-sync\zvpn-conprof.log"
 
+# --- Log rotation ---------------------------------------------------------
+# Size at which the log is rotated, in bytes. A single run writes well under a
+# kilobyte, but the trigger fires on every profile evaluation, so on a laptop
+# that reconnects all day the file does need a ceiling. Set to 0 to disable
+# rotation and let the log grow without limit.
+$MaxLogSizeBytes = 1MB
+
+# How many rotated copies to keep alongside the live log (zvpn-conprof.log.1,
+# .log.2, ...). Worst case on disk is ($LogRetainedFiles + 1) * $MaxLogSizeBytes,
+# so the default keeps the whole thing under about 2 MB. 0 discards the old log
+# instead of keeping a copy.
+$LogRetainedFiles = 1
+
 # =============================================================================
 # CONFIG FILE (optional) - overrides the defaults above
 #
@@ -131,6 +144,8 @@ foreach ($_cfgPath in $_cfgCandidates) {
         if ($_p['VerifyTimeoutSeconds'])          { $VerifyTimeoutSeconds          = [int]$cfg.VerifyTimeoutSeconds }
         if ($_p['PostRegisterDelaySeconds'])      { $PostRegisterDelaySeconds      = [int]$cfg.PostRegisterDelaySeconds }
         if ($_p['LogFile'])                       { $LogFile                       = [string]$cfg.LogFile }
+        if ($_p['MaxLogSizeBytes'])               { $MaxLogSizeBytes               = [long]$cfg.MaxLogSizeBytes }
+        if ($_p['LogRetainedFiles'])              { $LogRetainedFiles              = [int]$cfg.LogRetainedFiles }
 
         $ConfigLoadedFrom = $_cfgPath
     }
@@ -149,6 +164,10 @@ Remove-Variable cfg, _p, _cfgPath, _cfgCandidates -ErrorAction SilentlyContinue
 # it here rather than trusting the file.
 if ($PollIntervalSeconds -lt 1) { $PollIntervalSeconds = 1 }
 
+# A negative retention count would run the rotation loop backwards; 0 is a valid
+# setting and means "keep no copies".
+if ($LogRetainedFiles -lt 0) { $LogRetainedFiles = 0 }
+
 # =============================================================================
 # SCRIPT INTERNALS - no changes needed below this line
 # =============================================================================
@@ -156,12 +175,69 @@ if ($PollIntervalSeconds -lt 1) { $PollIntervalSeconds = 1 }
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+function New-LogEntry {
+    param([string]$Message, [string]$Level)
+    return "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
+}
+
+# Rotation is checked once per run rather than on every line: a run writes a
+# couple of dozen entries, and stat-ing the file for each of them buys nothing.
+# The consequence is that the file can overshoot $MaxLogSizeBytes by one run's
+# worth of output before the next run trims it, which is a few hundred bytes.
+$LogRotationChecked = $false
+
+# Ages the log files off the end - the oldest copy is deleted, each remaining
+# one moves up a number, and the live log becomes .1. Returns $null normally, or
+# a formatted entry for the caller to log. Rotation failing is not fatal: the
+# existing file is still there to append to and the next run tries again, so the
+# failure is reported rather than thrown.
+function Invoke-LogRotation {
+    if ($MaxLogSizeBytes -le 0) { return $null }
+
+    $current = Get-Item -LiteralPath $LogFile -ErrorAction SilentlyContinue
+    if (-not $current -or $current.Length -lt $MaxLogSizeBytes) { return $null }
+
+    try {
+        # A retention count lowered since the last rotation leaves copies above
+        # it that nothing would ever move or delete again. Numbering is
+        # contiguous, so stopping at the first gap clears all of them.
+        $orphan = $LogRetainedFiles + 1
+        while (Test-Path -LiteralPath "$LogFile.$orphan") {
+            Remove-Item -LiteralPath "$LogFile.$orphan" -Force
+            $orphan++
+        }
+
+        # Highest number first, so each slot is free before the file below it
+        # moves into it.
+        for ($i = $LogRetainedFiles; $i -ge 1; $i--) {
+            $archive = "$LogFile.$i"
+            if (-not (Test-Path -LiteralPath $archive)) { continue }
+            if ($i -eq $LogRetainedFiles) { Remove-Item -LiteralPath $archive -Force }
+            else { Move-Item -LiteralPath $archive -Destination "$LogFile.$($i + 1)" -Force }
+        }
+
+        if ($LogRetainedFiles -ge 1) {
+            Move-Item -LiteralPath $LogFile -Destination "$LogFile.1" -Force
+            return (New-LogEntry "Rotated previous log ($($current.Length) bytes) to '$LogFile.1'" "INFO")
+        }
+
+        Remove-Item -LiteralPath $LogFile -Force
+        return (New-LogEntry "Discarded previous log ($($current.Length) bytes) - LogRetainedFiles is 0" "INFO")
+    }
+    catch {
+        # Usually a second instance of this script holding the file open - the
+        # trigger event can fire twice in quick succession - or the log open in
+        # a viewer.
+        return (New-LogEntry "Could not rotate log file: $_" "WARN")
+    }
+}
+
 function Write-Log {
     param(
         [Parameter(Mandatory)][string]$Message,
         [ValidateSet("INFO","WARN","ERROR")][string]$Level = "INFO"
     )
-    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
+    $entry = New-LogEntry $Message $Level
     Write-Host $entry
     if ([string]::IsNullOrWhiteSpace($LogFile)) { return }
     try {
@@ -169,7 +245,23 @@ function Write-Log {
         if (-not (Test-Path $logDir)) {
             New-Item -ItemType Directory -Path $logDir -Force | Out-Null
         }
+
+        # Flag first, so a rotation that throws unexpectedly is not retried on
+        # every subsequent line.
+        $rotationNote = $null
+        if (-not $script:LogRotationChecked) {
+            $script:LogRotationChecked = $true
+            $rotationNote = Invoke-LogRotation
+        }
+
         Add-Content -Path $LogFile -Value $entry -Encoding UTF8
+
+        # After the entry, so the rotated file's last line and the new file's
+        # first line are both real script output rather than bookkeeping.
+        if ($rotationNote) {
+            Write-Host $rotationNote
+            Add-Content -Path $LogFile -Value $rotationNote -Encoding UTF8
+        }
     }
     catch {
         Write-Host "[WARN] Could not write to log file: $_"
@@ -371,7 +463,8 @@ else                        { Write-Log "No config file found - using in-script 
 # Nothing about this runs interactively, so state what is actually in effect.
 Write-Log ("Settings: Reclassify=$EnableProfileReclassification DnsRegistration=$EnableDnsRegistration " +
            "DnsServer='$DnsServerAddress' DnsSuffix='$DnsSuffix' AdapterTimeout=${AdapterTimeoutSeconds}s " +
-           "Poll=${PollIntervalSeconds}s Verify=$VerifyRegistration Timeout=${VerifyTimeoutSeconds}s")
+           "Poll=${PollIntervalSeconds}s Verify=$VerifyRegistration Timeout=${VerifyTimeoutSeconds}s " +
+           "MaxLogSize=${MaxLogSizeBytes}B LogRetained=$LogRetainedFiles")
 
 try {
     # Inside the try so an unexpected failure in the check itself still gets

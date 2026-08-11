@@ -134,6 +134,8 @@ Config keys and the script variables they override are named identically, minus 
 | `$VerifyTimeoutSeconds` | How long to wait for the record to appear (default: `30`) |
 | `$PostRegisterDelaySeconds` | Settle delay used instead of verification when `$VerifyRegistration` is `false` |
 | `$LogFile` | Activity log (default: `C:\ProgramData\zpa-vpn-sync\zvpn-conprof.log`) |
+| `$MaxLogSizeBytes` | Rotate the log once it reaches this size (default: `1048576`, i.e. 1 MB). `0` disables rotation |
+| `$LogRetainedFiles` | Rotated copies to keep (default: `1`). `0` discards the old log instead of keeping a copy |
 
 In JSON, write booleans unquoted (`true`, not `"true"`) and escape backslashes in Windows paths (`"C:\\ProgramData\\..."`).
 
