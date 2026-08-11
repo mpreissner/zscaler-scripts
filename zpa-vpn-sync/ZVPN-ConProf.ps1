@@ -20,6 +20,11 @@
 
 # =============================================================================
 # USER CONFIGURATION
+#
+# These are the fallback defaults. An optional zvpn-conprof.config.json placed
+# alongside this script (or in C:\ProgramData\zpa-vpn-sync\) overrides any of
+# them - see the CONFIG FILE section below. Using the config file is preferred:
+# upgrading the script is then a file replacement rather than a re-edit.
 # =============================================================================
 
 # Interface alias of the ZPA VPN for Legacy Apps adapter
@@ -72,6 +77,77 @@ $PostRegisterDelaySeconds = 5
 # only - note that a GPO scheduled task running as SYSTEM has nowhere to show
 # stdout, so a file is strongly recommended.
 $LogFile = "C:\ProgramData\zpa-vpn-sync\zvpn-conprof.log"
+
+# =============================================================================
+# CONFIG FILE (optional) - overrides the defaults above
+#
+# Copy zvpn-conprof.config.json.example -> zvpn-conprof.config.json and put it
+# either alongside this script or in C:\ProgramData\zpa-vpn-sync\. The first of
+# those found wins; any setting the file omits keeps its value from above.
+#
+# Keeping settings in the config file makes a script upgrade a straight file
+# replacement - no re-editing the block above on every version.
+#
+# This runs before Set-StrictMode deliberately: under StrictMode, reading a
+# property the JSON does not define throws instead of returning nothing.
+# =============================================================================
+
+# JSON booleans arrive as [bool] already, but a hand-edited file may quote them,
+# and [bool]"false" is $true - which would silently enable a disabled job.
+function ConvertTo-ConfigBool {
+    param($Value)
+    if ($Value -is [string]) { return $Value -match '^\s*(?i:true|yes|on|1)\s*$' }
+    return [bool]$Value
+}
+
+$ConfigLoadedFrom = $null
+$ConfigLoadError  = $null
+
+$_cfgCandidates = @()
+if ($PSScriptRoot) { $_cfgCandidates += (Join-Path $PSScriptRoot "zvpn-conprof.config.json") }
+$_cfgCandidates += "C:\ProgramData\zpa-vpn-sync\zvpn-conprof.config.json"
+
+foreach ($_cfgPath in $_cfgCandidates) {
+    if (-not (Test-Path $_cfgPath)) { continue }
+
+    # First existing candidate is the config, valid or not - fall through to a
+    # different file on a parse error and the machine runs settings nobody
+    # intended. Report the failure and carry on with whatever is in effect.
+    try {
+        $cfg = Get-Content $_cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $_p  = $cfg.PSObject.Properties
+
+        # Presence tests, not truthiness - $false, 0 and "" are all meaningful
+        # settings here and must still override the defaults above. $DnsSuffix
+        # in particular uses "" to mean "the primary domain suffix".
+        if ($_p['TargetAlias'] -and $cfg.TargetAlias) { $TargetAlias = [string]$cfg.TargetAlias }
+        if ($_p['EnableProfileReclassification']) { $EnableProfileReclassification = ConvertTo-ConfigBool $cfg.EnableProfileReclassification }
+        if ($_p['EnableDnsRegistration'])         { $EnableDnsRegistration         = ConvertTo-ConfigBool $cfg.EnableDnsRegistration }
+        if ($_p['DnsServerAddress'])              { $DnsServerAddress              = [string]$cfg.DnsServerAddress }
+        if ($_p['DnsSuffix'])                     { $DnsSuffix                     = [string]$cfg.DnsSuffix }
+        if ($_p['AdapterTimeoutSeconds'])         { $AdapterTimeoutSeconds         = [int]$cfg.AdapterTimeoutSeconds }
+        if ($_p['PollIntervalSeconds'])           { $PollIntervalSeconds           = [int]$cfg.PollIntervalSeconds }
+        if ($_p['VerifyRegistration'])            { $VerifyRegistration            = ConvertTo-ConfigBool $cfg.VerifyRegistration }
+        if ($_p['VerifyTimeoutSeconds'])          { $VerifyTimeoutSeconds          = [int]$cfg.VerifyTimeoutSeconds }
+        if ($_p['PostRegisterDelaySeconds'])      { $PostRegisterDelaySeconds      = [int]$cfg.PostRegisterDelaySeconds }
+        if ($_p['LogFile'])                       { $LogFile                       = [string]$cfg.LogFile }
+
+        $ConfigLoadedFrom = $_cfgPath
+    }
+    catch {
+        # A bad value part-way down the list leaves the keys above it applied
+        # and everything below it at its default, so log the settings actually
+        # in effect rather than implying one or the other.
+        $ConfigLoadError = "Config file '$_cfgPath' was not fully applied - fix the file, or check the settings below: $_"
+    }
+    break
+}
+
+Remove-Variable cfg, _p, _cfgPath, _cfgCandidates -ErrorAction SilentlyContinue
+
+# A zero or negative poll interval turns every wait loop into a spin, so floor
+# it here rather than trusting the file.
+if ($PollIntervalSeconds -lt 1) { $PollIntervalSeconds = 1 }
 
 # =============================================================================
 # SCRIPT INTERNALS - no changes needed below this line
@@ -263,6 +339,16 @@ function Register-TunnelAddress {
 # MAIN
 # =============================================================================
 Write-Log "=== ZVPN connection profile script starting (adapter: '$TargetAlias') ==="
+
+# Deferred from the config block above, which runs before Write-Log exists.
+if ($ConfigLoadError)       { Write-Log $ConfigLoadError "WARN" }
+elseif ($ConfigLoadedFrom)  { Write-Log "Configuration loaded from '$ConfigLoadedFrom'" }
+else                        { Write-Log "No config file found - using in-script defaults" }
+
+# Nothing about this runs interactively, so state what is actually in effect.
+Write-Log ("Settings: Reclassify=$EnableProfileReclassification DnsRegistration=$EnableDnsRegistration " +
+           "DnsServer='$DnsServerAddress' DnsSuffix='$DnsSuffix' AdapterTimeout=${AdapterTimeoutSeconds}s " +
+           "Poll=${PollIntervalSeconds}s Verify=$VerifyRegistration Timeout=${VerifyTimeoutSeconds}s")
 
 try {
     $tunnelIp = Wait-ForTunnelAddress

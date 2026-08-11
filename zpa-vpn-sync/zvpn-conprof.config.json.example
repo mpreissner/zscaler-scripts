@@ -1,0 +1,13 @@
+{
+    "TargetAlias":                   "Zscaler Tunnel",
+    "EnableProfileReclassification": true,
+    "EnableDnsRegistration":         false,
+    "DnsServerAddress":              "10.10.10.10",
+    "DnsSuffix":                     "",
+    "AdapterTimeoutSeconds":         60,
+    "PollIntervalSeconds":           2,
+    "VerifyRegistration":            true,
+    "VerifyTimeoutSeconds":          30,
+    "PostRegisterDelaySeconds":      5,
+    "LogFile":                       "C:\\ProgramData\\zpa-vpn-sync\\zvpn-conprof.log"
+}

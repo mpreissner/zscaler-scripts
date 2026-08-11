@@ -13,6 +13,7 @@ Tom O'Leary, Mike Preissner
 | `zpa-dns-sync-oneapi.ps1` | Core sync script. Authenticates to ZPA via OneAPI (OAuth2 client_credentials), fetches all connected VPN users with pagination, and adds or updates A records in the target AD DNS zone. A local state cache avoids redundant DNS operations for entries that haven't changed. |
 | `zpa-dns-sync.config.json.example` | Template for the optional external config file — copy to `zpa-dns-sync.config.json` alongside the script and fill in your values. |
 | `ZVPN-ConProf.ps1` | Client-side script, GPO-deployed. Reclassifies the "Zscaler Tunnel" adapter as a Private network interface for a less restrictive host firewall, and optionally registers the tunnel IP in AD DNS using Windows' built-in dynamic update. |
+| `zvpn-conprof.config.json.example` | Template for the optional external config file used by `ZVPN-ConProf.ps1` — copy to `zvpn-conprof.config.json` alongside the script and fill in your values. |
 | `ZVPN-SchedTaskConfig.txt` | Instructions for deploying a Scheduled Task via Group Policy Objects to run ZVPN-ConProf.ps1 on detection of Zscaler Tunnel Up in Windows Event Log. |
 
 ## Requirements
@@ -96,32 +97,45 @@ Activity is written to `$LogFile` and echoed to stdout. Each entry is timestampe
 
 ## Setup - ZVPN Network Connection Profile Update
 
-`ZVPN-ConProf.ps1` runs on the client when the Zscaler Tunnel adapter comes up and performs two independent jobs, each separately switchable at the top of the script:
+`ZVPN-ConProf.ps1` runs on the client when the Zscaler Tunnel adapter comes up and performs two independent jobs, each separately switchable via the config file or the top of the script:
 
 | Job | Setting | Default |
 |-----|---------|---------|
 | Reclassify the tunnel adapter as a Private network | `$EnableProfileReclassification` | `$true` |
 | Register the tunnel IP in AD DNS via Windows dynamic update | `$EnableDnsRegistration` | `$false` |
 
-1. Edit the **USER CONFIGURATION** block at the top of `ZVPN-ConProf.ps1` — at minimum set `$DnsServerAddress` and `$DnsSuffix` if you are enabling DNS registration.
-2. Host the file on a network share.
+1. Copy `zvpn-conprof.config.json.example` to `zvpn-conprof.config.json` and set your values (see [Client configuration](#client-configuration) below) — at minimum `DnsServerAddress` and `DnsSuffix` if you are enabling DNS registration. Alternatively, edit the **USER CONFIGURATION** block at the top of `ZVPN-ConProf.ps1`.
+2. Host the file on a network share, with the config file alongside it.
 3. Use GPO to create a Scheduled Task on all clients per the instructions in `ZVPN-SchedTaskConfig.txt`.
 
 ### Client configuration
 
-| Variable | Description |
+As with the DNS sync script, settings can come from an external config file or from the script itself — **the config file wins**. Keeping your settings in the config file means upgrading `ZVPN-ConProf.ps1` is a straight file replacement, with no need to re-apply your edits to each new version.
+
+The script looks for `zvpn-conprof.config.json` in two places and uses the first one it finds:
+
+1. Alongside the script (`$PSScriptRoot`) — the usual choice, and the one to use when the script runs from a network share.
+2. `C:\ProgramData\zpa-vpn-sync\zvpn-conprof.config.json` — for a per-machine override when the script directory is read-only or shared across sites.
+
+Any key the file omits keeps its in-script default, so a config file only needs the settings you actually want to change. If the file is present but unparseable it is reported as a `[WARN]` in the log and the in-script defaults are used — the script does not silently fall through to the other location. Each run logs which config file it loaded, or that it found none.
+
+Config keys and the script variables they override are named identically, minus the `$`:
+
+| Variable / JSON key | Description |
 |----------|-------------|
 | `$TargetAlias` | Interface alias of the VPN adapter (default: `Zscaler Tunnel`) |
-| `$EnableProfileReclassification` | Flip the adapter's network category to Private |
-| `$EnableDnsRegistration` | Register the tunnel IP in AD DNS |
+| `$EnableProfileReclassification` | Flip the adapter's network category to Private (default: `true`) |
+| `$EnableDnsRegistration` | Register the tunnel IP in AD DNS (default: `false`) |
 | `$DnsServerAddress` | Internal DNS server that will accept the dynamic update — **required** when DNS registration is enabled |
 | `$DnsSuffix` | Connection-specific suffix to register under. Empty = the machine's primary domain suffix |
 | `$AdapterTimeoutSeconds` | How long to wait for the adapter to obtain a usable IPv4 address (default: `60`) |
-| `$PollIntervalSeconds` | Poll interval while waiting (default: `2`) |
-| `$VerifyRegistration` | Confirm the record landed before releasing the adapter (default: `$true`) |
+| `$PollIntervalSeconds` | Poll interval while waiting (default: `2`, minimum `1`) |
+| `$VerifyRegistration` | Confirm the record landed before releasing the adapter (default: `true`) |
 | `$VerifyTimeoutSeconds` | How long to wait for the record to appear (default: `30`) |
-| `$PostRegisterDelaySeconds` | Settle delay used instead of verification when `$VerifyRegistration` is `$false` |
+| `$PostRegisterDelaySeconds` | Settle delay used instead of verification when `$VerifyRegistration` is `false` |
 | `$LogFile` | Activity log (default: `C:\ProgramData\zpa-vpn-sync\zvpn-conprof.log`) |
+
+In JSON, write booleans unquoted (`true`, not `"true"`) and escape backslashes in Windows paths (`"C:\\ProgramData\\..."`).
 
 ## How it works
 
