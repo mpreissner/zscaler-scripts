@@ -12,7 +12,7 @@ Tom O'Leary, Mike Preissner
 |------|---------|
 | `zpa-dns-sync-oneapi.ps1` | Core sync script. Authenticates to ZPA via OneAPI (OAuth2 client_credentials), fetches all connected VPN users with pagination, and adds or updates A records in the target AD DNS zone. A local state cache avoids redundant DNS operations for entries that haven't changed. |
 | `zpa-dns-sync.config.json.example` | Template for the optional external config file — copy to `zpa-dns-sync.config.json` alongside the script and fill in your values. |
-| `ZVPN-ConProf.ps1` | Client-side script, GPO-deployed. Reclassifies the "Zscaler Tunnel" adapter as a Private network interface for a less restrictive host firewall, and optionally registers the tunnel IP in AD DNS using Windows' built-in dynamic update. |
+| `ZVPN-ConProf.ps1` | Client-side script, GPO-deployed. Reclassifies the "Zscaler Tunnel" adapter as a Private network interface for a less restrictive host firewall, and optionally registers the tunnel IP in AD DNS using Windows' built-in dynamic update. A local state file limits registrations to runs where the address actually changed, and the activity log is size-capped and rotated. |
 | `zvpn-conprof.config.json.example` | Template for the optional external config file used by `ZVPN-ConProf.ps1` — copy to `zvpn-conprof.config.json` alongside the script and fill in your values. |
 | `ZVPN-SchedTaskConfig.txt` | Instructions for deploying a Scheduled Task via Group Policy Objects to run ZVPN-ConProf.ps1 on detection of Zscaler Tunnel Up in Windows Event Log. |
 
@@ -128,6 +128,8 @@ Config keys and the script variables they override are named identically, minus 
 | `$EnableDnsRegistration` | Register the tunnel IP in AD DNS (default: `false`) |
 | `$DnsServerAddress` | Internal DNS server that will accept the dynamic update — **required** when DNS registration is enabled |
 | `$DnsSuffix` | Connection-specific suffix to register under. Empty = the machine's primary domain suffix |
+| `$StateFile` | Records the last successful registration so unchanged addresses are skipped (default: `C:\ProgramData\zpa-vpn-sync\zvpn-conprof.state.json`). Empty = register on every run |
+| `$ForceRegisterAfterHours` | Re-register an unchanged address once the last registration is this old (default: `24`). `0` = only ever register on change |
 | `$AdapterTimeoutSeconds` | How long to wait for the adapter to obtain a usable IPv4 address (default: `60`) |
 | `$PollIntervalSeconds` | Poll interval while waiting (default: `2`, minimum `1`) |
 | `$VerifyRegistration` | Confirm the record landed before releasing the adapter (default: `true`) |
@@ -158,7 +160,7 @@ Note that a non-elevated run can still *look* like it partly worked: the reclass
 2. Scheduled Task triggers on Event ID 10000 in the Microsoft-Windows-NetworkProfile/Operational log, with source NetworkProfile.
 3. The script waits for the "Zscaler Tunnel" adapter to hold a usable IPv4 address. Event 10000 fires when the network profile is evaluated, which can beat the adapter actually being addressable, so it polls rather than assumes. APIPA (`169.254.x.x`) and non-`Preferred` addresses do not count.
 4. It checks the network profile assigned to the interface and changes it to Private if necessary.
-5. If DNS registration is enabled, it registers the tunnel address (see below).
+5. If DNS registration is enabled, it registers the tunnel address — but only if that address (or the name it registers under) has changed since the last run (see below).
 
 ### Dynamic DNS registration
 
@@ -169,6 +171,17 @@ The tunnel adapter comes up with no DNS servers and no connection-specific suffi
 3. Calls `Register-DnsClient`.
 4. Polls the DNS server until the record resolves to the tunnel IP.
 5. Removes the DNS server from the adapter again.
+
+**Only when something changed.** The scheduled task fires on every network profile evaluation, so on a machine that reconnects through the day this job would otherwise send a secure dynamic update to a domain controller several times an hour, almost all of them writing the address that is already there. The script records each successful registration in `$StateFile` and does the work again only when:
+
+- the tunnel address differs from the recorded one, or
+- the name being registered differs (you changed `$DnsSuffix`, or the machine's primary domain suffix changed), or
+- the recorded registration is older than `$ForceRegisterAfterHours`, or
+- there is no usable state file — missing, unreadable, or written by a clock that has since moved backwards.
+
+The refresh interval matters: AD DNS scavenging deletes records that stop being refreshed (with the usual 7-day no-refresh / 7-day refresh intervals, a record goes after 14 days), so an address that never changes still needs an occasional touch. The 24-hour default matches what the Windows DNS client does with its own registrations and is well inside any sane scavenging window. Set it to `0` only if scavenging is disabled on the zone.
+
+The state file is only written after the registration is confirmed, so a failed or unverified update is retried on the next trigger rather than being skipped as already done. With `$VerifyRegistration` set to `false` there is nothing to confirm it, so a submission that was accepted locally but never landed will be treated as done until the refresh interval comes round — another reason to leave verification on. Deleting the state file forces a registration on the next run.
 
 Step 5 always runs, including when an earlier step throws — leaving an internal DNS server pinned to the tunnel adapter would affect all name resolution on the machine once the tunnel drops. Step 4 deliberately runs *before* step 5: `Register-DnsClient` hands the update to the DNS Client service and returns immediately, so releasing the adapter too early can cut the update off before it is sent.
 

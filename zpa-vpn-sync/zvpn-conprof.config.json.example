@@ -4,6 +4,8 @@
     "EnableDnsRegistration":         false,
     "DnsServerAddress":              "10.10.10.10",
     "DnsSuffix":                     "",
+    "StateFile":                     "C:\\ProgramData\\zpa-vpn-sync\\zvpn-conprof.state.json",
+    "ForceRegisterAfterHours":       24,
     "AdapterTimeoutSeconds":         60,
     "PollIntervalSeconds":           2,
     "VerifyRegistration":            true,

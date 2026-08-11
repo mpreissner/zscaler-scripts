@@ -8,7 +8,9 @@
 #      Firewall stops dropping inbound connections over the tunnel.
 #   2. Register the adapter's tunnel IP in AD DNS using Windows' own dynamic
 #      update mechanism, so the record is owned by the computer account and the
-#      machine can update it itself when it returns on-prem.
+#      machine can update it itself when it returns on-prem. The last
+#      registration is recorded in $StateFile and the update is skipped while
+#      the address is unchanged.
 #
 # Deployed via GPO and triggered by Event ID 10000 in the
 # Microsoft-Windows-NetworkProfile/Operational log. See ZVPN-SchedTaskConfig.txt.
@@ -58,6 +60,22 @@ $DnsServerAddress = "10.10.10.10"
 #                       addresses in a dedicated zone. Match this to $DnsZone
 #                       in zpa-dns-sync-oneapi.ps1 if you run both.
 $DnsSuffix = ""
+
+# Where the last successful registration is recorded, so a run that finds the
+# same address under the same name can skip the update entirely. The trigger
+# fires on every network profile evaluation - without this, a laptop that
+# reconnects all day sends a secure dynamic update to a domain controller every
+# time, none of which change anything. Set to "" to disable the tracking and
+# register on every run.
+$StateFile = "C:\ProgramData\zpa-vpn-sync\zvpn-conprof.state.json"
+
+# Re-register even when nothing changed, once the last registration is this old.
+# AD DNS scavenging deletes records that stop being refreshed - with the usual
+# 7-day no-refresh / 7-day refresh intervals a record goes after 14 days - so an
+# unchanging address still needs an occasional touch. 24 hours matches what the
+# Windows DNS client does with its own registrations. Set to 0 to refresh only
+# when the address changes.
+$ForceRegisterAfterHours = 24
 
 # --- Adapter readiness ----------------------------------------------------
 # Event 10000 fires when the network profile is evaluated, which can beat the
@@ -138,6 +156,8 @@ foreach ($_cfgPath in $_cfgCandidates) {
         if ($_p['EnableDnsRegistration'])         { $EnableDnsRegistration         = ConvertTo-ConfigBool $cfg.EnableDnsRegistration }
         if ($_p['DnsServerAddress'])              { $DnsServerAddress              = [string]$cfg.DnsServerAddress }
         if ($_p['DnsSuffix'])                     { $DnsSuffix                     = [string]$cfg.DnsSuffix }
+        if ($_p['StateFile'])                     { $StateFile                     = [string]$cfg.StateFile }
+        if ($_p['ForceRegisterAfterHours'])       { $ForceRegisterAfterHours       = [int]$cfg.ForceRegisterAfterHours }
         if ($_p['AdapterTimeoutSeconds'])         { $AdapterTimeoutSeconds         = [int]$cfg.AdapterTimeoutSeconds }
         if ($_p['PollIntervalSeconds'])           { $PollIntervalSeconds           = [int]$cfg.PollIntervalSeconds }
         if ($_p['VerifyRegistration'])            { $VerifyRegistration            = ConvertTo-ConfigBool $cfg.VerifyRegistration }
@@ -167,6 +187,10 @@ if ($PollIntervalSeconds -lt 1) { $PollIntervalSeconds = 1 }
 # A negative retention count would run the rotation loop backwards; 0 is a valid
 # setting and means "keep no copies".
 if ($LogRetainedFiles -lt 0) { $LogRetainedFiles = 0 }
+
+# Negative would make every stored registration look overdue, turning the
+# refresh interval into "register every run".
+if ($ForceRegisterAfterHours -lt 0) { $ForceRegisterAfterHours = 0 }
 
 # =============================================================================
 # SCRIPT INTERNALS - no changes needed below this line
@@ -376,6 +400,111 @@ function Test-RegistrationLanded {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Registration state
+# ---------------------------------------------------------------------------
+# What was last registered, or $null when there is nothing usable on disk. Any
+# problem reading the file resolves to $null - re-registering costs one update,
+# whereas trusting a half-read file could suppress a needed one.
+function Get-RegistrationState {
+    if ([string]::IsNullOrWhiteSpace($StateFile)) { return $null }
+    if (-not (Test-Path -LiteralPath $StateFile)) { return $null }
+
+    try {
+        $raw = Get-Content -LiteralPath $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $props = $raw.PSObject.Properties
+        if (-not ($props['IPAddress'] -and $props['Fqdn'] -and $props['LastRegistered'])) {
+            Write-Log "State file '$StateFile' is missing fields - treating as no previous registration" "WARN"
+            return $null
+        }
+        # ConvertFrom-Json turns an ISO 8601 string into a [datetime] on its own,
+        # so the stamp arrives already converted on some hosts and as a string on
+        # others. Re-parsing a [datetime] would stringify it in the current
+        # culture first, dropping the UTC marker and shifting the value by the
+        # local offset - which reads as a registration in the future.
+        $stamp = $raw.LastRegistered
+        if ($stamp -is [datetime]) {
+            $lastRegistered = $stamp.ToUniversalTime()
+        }
+        else {
+            $lastRegistered = [datetime]::Parse([string]$stamp, [cultureinfo]::InvariantCulture,
+                                  [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+        }
+
+        return [pscustomobject]@{
+            IPAddress      = [string]$raw.IPAddress
+            Fqdn           = [string]$raw.Fqdn
+            LastRegistered = $lastRegistered
+        }
+    }
+    catch {
+        Write-Log "Could not read state file '$StateFile' - treating as no previous registration: $_" "WARN"
+        return $null
+    }
+}
+
+# Only ever called after a registration the script is confident in, so a stored
+# entry means "this name really did resolve to this address".
+function Save-RegistrationState {
+    param([string]$Fqdn, [string]$IPAddress)
+    if ([string]::IsNullOrWhiteSpace($StateFile)) { return }
+
+    try {
+        $stateDir = Split-Path $StateFile -Parent
+        if ($stateDir -and -not (Test-Path $stateDir)) {
+            New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+        }
+        [pscustomobject]@{
+            IPAddress      = $IPAddress
+            Fqdn           = $Fqdn
+            LastRegistered = (Get-Date).ToUniversalTime().ToString("o")
+        } | ConvertTo-Json | Set-Content -LiteralPath $StateFile -Encoding UTF8
+    }
+    catch {
+        # Not worth failing the run over - the cost of a lost state file is one
+        # redundant registration on the next trigger.
+        Write-Log "Could not write state file '$StateFile': $_" "WARN"
+    }
+}
+
+function Test-RegistrationRequired {
+    param([string]$Fqdn, [string]$IPAddress)
+
+    $state = Get-RegistrationState
+    if (-not $state) {
+        Write-Log "No previous registration recorded - registering"
+        return $true
+    }
+
+    if ($state.Fqdn -ne $Fqdn) {
+        Write-Log "Registration name changed ('$($state.Fqdn)' -> '$Fqdn') - registering"
+        return $true
+    }
+
+    if ($state.IPAddress -ne $IPAddress) {
+        Write-Log "Tunnel address changed ($($state.IPAddress) -> $IPAddress) - registering"
+        return $true
+    }
+
+    $age = (Get-Date).ToUniversalTime() - $state.LastRegistered
+
+    # A state file stamped in the future means the clock moved backwards since
+    # it was written. Left alone the record would never look due again.
+    if ($age.TotalHours -lt 0) {
+        Write-Log "State file is stamped in the future (clock change?) - registering" "WARN"
+        return $true
+    }
+
+    if ($ForceRegisterAfterHours -gt 0 -and $age.TotalHours -ge $ForceRegisterAfterHours) {
+        Write-Log ("Address unchanged but last registered {0:N1}h ago (refresh interval {1}h) - re-registering" -f `
+                   $age.TotalHours, $ForceRegisterAfterHours)
+        return $true
+    }
+
+    Write-Log ("$Fqdn already registered as $IPAddress {0:N1}h ago - skipping DNS registration" -f $age.TotalHours)
+    return $false
+}
+
 function Register-TunnelAddress {
     param([Parameter(Mandatory)][string]$IPAddress)
 
@@ -390,12 +519,20 @@ function Register-TunnelAddress {
         return
     }
 
+    # Decided before anything touches the adapter: an unchanged address needs no
+    # update, and the DNS server juggling below is not free either.
+    if (-not (Test-RegistrationRequired -Fqdn $fqdn -IPAddress $IPAddress)) { return }
+
     Write-Log "Registering $fqdn -> $IPAddress via $DnsServerAddress"
 
     # Only reset an address that was actually applied. If the apply itself
     # failed there is nothing pinned to the adapter, and resetting anyway just
     # fails a second time and buries the real error under a follow-on one.
     $dnsServerApplied = $false
+
+    # Recorded only on success, so a failed run is retried on the next trigger
+    # instead of being skipped as "already registered".
+    $registered = $false
 
     try {
         # The DNS server address is applied to the tunnel adapter only for the
@@ -423,12 +560,18 @@ function Register-TunnelAddress {
         # Register-DnsClient is asynchronous, and pulling the server address
         # too early can cut the update off before it is sent.
         if ($VerifyRegistration) {
-            if (-not (Test-RegistrationLanded -Fqdn $fqdn -ExpectedIp $IPAddress)) {
+            if (Test-RegistrationLanded -Fqdn $fqdn -ExpectedIp $IPAddress) {
+                $registered = $true
+            }
+            else {
                 Write-Log "Registration not visible on $DnsServerAddress after ${VerifyTimeoutSeconds}s. Check that the DNS server is reachable through the tunnel and that the zone accepts secure dynamic updates." "WARN"
             }
         }
         else {
             Start-Sleep -Seconds $PostRegisterDelaySeconds
+            # Nothing confirmed it landed - with verification off, "submitted
+            # without error" is the strongest signal available.
+            $registered = $true
         }
     }
     catch {
@@ -448,6 +591,9 @@ function Register-TunnelAddress {
             }
         }
     }
+
+    # After the finally block, so the adapter is always handed back first.
+    if ($registered) { Save-RegistrationState -Fqdn $fqdn -IPAddress $IPAddress }
 }
 
 # =============================================================================
@@ -464,7 +610,8 @@ else                        { Write-Log "No config file found - using in-script 
 Write-Log ("Settings: Reclassify=$EnableProfileReclassification DnsRegistration=$EnableDnsRegistration " +
            "DnsServer='$DnsServerAddress' DnsSuffix='$DnsSuffix' AdapterTimeout=${AdapterTimeoutSeconds}s " +
            "Poll=${PollIntervalSeconds}s Verify=$VerifyRegistration Timeout=${VerifyTimeoutSeconds}s " +
-           "MaxLogSize=${MaxLogSizeBytes}B LogRetained=$LogRetainedFiles")
+           "MaxLogSize=${MaxLogSizeBytes}B LogRetained=$LogRetainedFiles " +
+           "StateFile='$StateFile' ForceRegisterAfter=${ForceRegisterAfterHours}h")
 
 try {
     # Inside the try so an unexpected failure in the check itself still gets
