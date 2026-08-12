@@ -5,7 +5,7 @@
 #
 # Retrieves VPN Legacy App connected users from Zscaler ZPA via OneAPI and
 # syncs their hostname-to-IP mappings as A records in an Active Directory DNS
-# zone. Records are added and updated unconditionally — a client connecting to
+# zone. Records are added and updated unconditionally - a client connecting to
 # the VPN overwrites whatever A record it previously registered on-net. When
 # $SyncDeletes is enabled, records are also removed once a host drops off the
 # ZPA connected-user list, so the name is free for the client to reclaim via
@@ -25,14 +25,14 @@
 
 
 # =============================================================================
-# USER CONFIGURATION — fill in all values before first run
+# USER CONFIGURATION - fill in all values before first run
 # =============================================================================
 
 # Zscaler OneAPI credentials (ZPA > Administration > API Key Management)
 $ClientId     = "YOUR_CLIENT_ID_HERE"
 $ClientSecret = "YOUR_CLIENT_SECRET_HERE"
 
-# Your ZIdentity vanity domain — the part before .zslogin.net
+# Your ZIdentity vanity domain - the part before .zslogin.net
 # e.g. if your ZIdentity URL is https://acme.zslogin.net, enter "acme"
 $VanityDomain = "yourcompany"
 
@@ -51,12 +51,12 @@ $RecordTtl    = 300
 # Where to write the activity log (directory is created automatically)
 $LogFile      = "C:\Logs\zpa-vpn-sync\zpa-vpn-sync.log"
 
-# State file — caches the hostname-to-IP map from the last successful run.
+# State file - caches the hostname-to-IP map from the last successful run.
 # Entries whose IP hasn't changed are skipped so DNS is only touched when
 # something actually changed. Format: { "hostname": "last-synced-ip" }
 $StateFile    = "C:\ProgramData\zpa-vpn-sync\managed-hosts.json"
 
-# ZPA API page size (1–500). 500 minimises round-trips.
+# ZPA API page size (1-500). 500 minimises round-trips.
 $PageSize     = 500
 
 # Remove A records for hosts that have dropped off the ZPA connected-user list.
@@ -69,8 +69,8 @@ $PageSize     = 500
 #
 # A record is only deleted when its current IP still matches what this script
 # last wrote for that host (per $StateFile). If the IP has changed, something
-# else has already taken the name over — most likely the client re-registering
-# after scavenging, or a manual fix — and that value is more current than ours,
+# else has already taken the name over - most likely the client re-registering
+# after scavenging, or a manual fix - and that value is more current than ours,
 # so the record is left alone. This check applies ONLY to the delete path;
 # adds and updates for a connecting client always overwrite whatever is there.
 $SyncDeletes  = $false
@@ -82,7 +82,7 @@ $SyncDeletes  = $false
 $MaxDeletesPerRun = 50
 
 # =============================================================================
-# CONFIG FILE (optional) — overrides the defaults above
+# CONFIG FILE (optional) - overrides the defaults above
 # Copy zpa-dns-sync.config.json.example -> zpa-dns-sync.config.json alongside
 # this script on the target machine and fill in your values. The config file
 # is gitignored so secrets stay off the repo.
@@ -100,7 +100,7 @@ if (Test-Path $_cfgPath) {
     if ($cfg.LogFile)      { $LogFile      = [string]$cfg.LogFile }
     if ($cfg.StateFile)    { $StateFile    = [string]$cfg.StateFile }
     if ($cfg.PageSize)     { $PageSize     = [int]$cfg.PageSize }
-    # Presence tests, not truthiness — a config value of false or 0 is a
+    # Presence tests, not truthiness - a config value of false or 0 is a
     # meaningful setting here and must still override the default above.
     if ($cfg.PSObject.Properties['SyncDeletes'])      { $SyncDeletes      = [bool]$cfg.SyncDeletes }
     if ($cfg.PSObject.Properties['MaxDeletesPerRun']) { $MaxDeletesPerRun = [int]$cfg.MaxDeletesPerRun }
@@ -108,7 +108,7 @@ if (Test-Path $_cfgPath) {
 }
 
 # =============================================================================
-# SCRIPT INTERNALS — no changes needed below this line
+# SCRIPT INTERNALS - no changes needed below this line
 # =============================================================================
 
 Set-StrictMode -Version Latest
@@ -182,7 +182,7 @@ function Get-AuthHeaders {
 }
 
 # ---------------------------------------------------------------------------
-# ZPA API — fetch all VPN connected users (handles pagination)
+# ZPA API - fetch all VPN connected users (handles pagination)
 # ---------------------------------------------------------------------------
 function Get-VPNConnectedUsers {
     Write-Log "Fetching VPN connected users from ZPA..."
@@ -208,7 +208,7 @@ function Get-VPNConnectedUsers {
         if ($resp.PSObject.Properties['totalPages']) {
             $totalPages = [int]$resp.totalPages
         }
-        Write-Log "  Page ${page}/${totalPages} — $($batch.Count) users"
+        Write-Log "  Page ${page}/${totalPages} - $($batch.Count) users"
         $page++
     } while ($page -le $totalPages)
 
@@ -217,7 +217,7 @@ function Get-VPNConnectedUsers {
 }
 
 # ---------------------------------------------------------------------------
-# State file — hostname -> last-synced-IP cache
+# State file - hostname -> last-synced-IP cache
 # ---------------------------------------------------------------------------
 function Read-StateFile {
     if (Test-Path $StateFile) {
@@ -230,7 +230,7 @@ function Read-StateFile {
             return $ht
         }
         catch {
-            Write-Log "Could not parse state file — treating as empty: $_" "WARN"
+            Write-Log "Could not parse state file - treating as empty: $_" "WARN"
         }
     }
     return @{}
@@ -264,13 +264,13 @@ function Sync-DNSRecords {
         }
         $dnsLabel = $hostname.Split('.')[0].ToLower()
         if ($vpnMap.ContainsKey($dnsLabel)) {
-            Write-Log "Duplicate DNS label '$dnsLabel' in API response — keeping first entry ($($vpnMap[$dnsLabel]))" "WARN"
+            Write-Log "Duplicate DNS label '$dnsLabel' in API response - keeping first entry ($($vpnMap[$dnsLabel]))" "WARN"
             continue
         }
         $vpnMap[$dnsLabel] = $ip
     }
 
-    # Load last-run IP cache — entries whose IP matches are skipped entirely.
+    # Load last-run IP cache - entries whose IP matches are skipped entirely.
     # $newState is built here: seeded with unchanged entries, updated on success
     # below, and written at the end. It contains only current VPN users, so
     # disconnected users are automatically pruned from the cache each run.
@@ -297,7 +297,7 @@ function Sync-DNSRecords {
         }
         if ($MaxDeletesPerRun -gt 0 -and $toDelete.Count -gt $MaxDeletesPerRun) {
             Write-Log ("$($toDelete.Count) records queued for deletion exceeds MaxDeletesPerRun " +
-                       "($MaxDeletesPerRun) — skipping ALL deletes this run. If the ZPA response " +
+                       "($MaxDeletesPerRun) - skipping ALL deletes this run. If the ZPA response " +
                        "was genuinely this much smaller, raise the cap or clear the state file.") "ERROR"
             # Carry the entries forward so a later run can still delete them.
             foreach ($label in $toDelete.Keys) { $newState[$label] = $toDelete[$label] }
@@ -305,7 +305,7 @@ function Sync-DNSRecords {
         }
     }
 
-    Write-Log "$($vpnMap.Count) connected users — $($toSync.Count) to sync, $($toDelete.Count) to delete, $skipped unchanged"
+    Write-Log "$($vpnMap.Count) connected users - $($toSync.Count) to sync, $($toDelete.Count) to delete, $skipped unchanged"
 
     if ($toSync.Count -eq 0 -and $toDelete.Count -eq 0) {
         Write-Log "No DNS changes required."
@@ -361,12 +361,12 @@ function Sync-DNSRecords {
             if ($existingMap.ContainsKey($label)) {
                 $currentIps = $existingMap[$label]
                 # Only a single record already holding the right IP is a no-op.
-                # Anything else — a different IP, or several records for the name —
+                # Anything else - a different IP, or several records for the name -
                 # is replaced. This deliberately overwrites records the script does
                 # not own: a client connecting to the VPN must supersede whatever
                 # address it dynamically registered while it was on-net.
                 if ($currentIps.Count -eq 1 -and $currentIps[0] -eq $ip) {
-                    Write-Log "VERIFY  $label.$DnsZone already $ip — no update needed"
+                    Write-Log "VERIFY  $label.$DnsZone already $ip - no update needed"
                 }
                 else {
                     Write-Log "UPDATE  $label.$DnsZone : $($currentIps -join ', ') -> $ip"
@@ -402,12 +402,12 @@ function Sync-DNSRecords {
         $lastIp = $toDelete[$label]
         try {
             if (-not $existingMap.ContainsKey($label)) {
-                Write-Log "GONE    $label.$DnsZone already absent — nothing to delete"
+                Write-Log "GONE    $label.$DnsZone already absent - nothing to delete"
                 continue
             }
             if ($existingMap[$label] -notcontains $lastIp) {
                 Write-Log ("KEEP    $label.$DnsZone is now $($existingMap[$label] -join ', '), " +
-                           "not the $lastIp this script wrote — reclaimed elsewhere, leaving it alone")
+                           "not the $lastIp this script wrote - reclaimed elsewhere, leaving it alone")
                 $reclaimed++
                 continue
             }
@@ -427,9 +427,9 @@ function Sync-DNSRecords {
 
     Write-StateFile -State $newState
 
-    Write-Log "Sync complete — added: $added  updated: $updated  deleted: $deleted  reclaimed: $reclaimed  errors: $errors"
+    Write-Log "Sync complete - added: $added  updated: $updated  deleted: $deleted  reclaimed: $reclaimed  errors: $errors"
     if ($errors -gt 0) {
-        Write-Log "$errors DNS operation(s) failed — review log for details" "WARN"
+        Write-Log "$errors DNS operation(s) failed - review log for details" "WARN"
     }
 }
 
