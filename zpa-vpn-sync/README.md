@@ -1,6 +1,13 @@
 # ZPA VPN DNS Sync
 
-Keeps an Active Directory DNS zone in sync with users currently connected via Zscaler Private Access (ZPA) VPN Legacy Apps. On each run it retrieves the live connected-user list from ZPA via OneAPI and adds or updates A records in the target zone so that on-prem resources can resolve VPN clients by hostname. Optionally (`SyncDeletes`) it also removes records once a host drops off the connected-user list.
+Gets the tunnel address of a Zscaler Private Access (ZPA) VPN client into an Active Directory DNS zone, so on-prem resources can resolve VPN clients by hostname.
+
+Two independent mechanisms are provided, and you should pick one as your primary:
+
+- **`ZVPN-ConProf.ps1`** — client-side, GPO-deployed. Each machine registers its own tunnel address using Windows' built-in dynamic update when the tunnel comes up. **Recommended for large deployments.**
+- **`zpa-dns-sync-oneapi.ps1`** — server-side. A scheduled task retrieves the live connected-user list from ZPA via OneAPI and adds or updates A records in the target zone. Optionally (`SyncDeletes`) it also removes records once a host drops off the list. Simpler to deploy and far easier to troubleshoot, and a good fit for smaller environments.
+
+See [Choosing an approach](#choosing-an-approach) for how to decide.
 
 ## Authors
 
@@ -16,12 +23,58 @@ Tom O'Leary, Mike Preissner
 | `zvpn-conprof.config.json.example` | Template for the optional external config file used by `ZVPN-ConProf.ps1` — copy to `zvpn-conprof.config.json` alongside the script and fill in your values. |
 | `ZVPN-SchedTaskConfig.txt` | Instructions for deploying a Scheduled Task via Group Policy Objects to run ZVPN-ConProf.ps1 on detection of Zscaler Tunnel Up in Windows Event Log. |
 
+## Choosing an approach
+
+Both mechanisms solve the same problem from opposite ends.
+
+| | Client-side (`ZVPN-ConProf.ps1`) | Server-side (`zpa-dns-sync-oneapi.ps1`) |
+|---|---|---|
+| Trigger | Each client, on tunnel up | Scheduled task, polling the ZPA API |
+| Record owner | The computer account | The script's service account |
+| Record type | Dynamic, timestamped | Static |
+| Write load | One update per client, spread across the day | Batched into each run |
+| Stale records | Cleaned up by scavenging | Need `SyncDeletes` |
+| Deployment | GPO to every endpoint | One server |
+| Troubleshooting | Per-machine logs | One central log |
+| Needs client→DC path | Yes (DNS + Kerberos) | No |
+
+### Prefer client-side at scale
+
+Two reasons, and the first matters more than the load argument.
+
+**Record ownership.** A record the client registers itself is owned by the computer account, so the machine can update it on its own when it returns on-net. Records written by the server-side script are static and owned by its service account, which is precisely what blocks an on-prem client from reclaiming its own name (see [Deleting records](#deleting-records)). Client-side, that problem never arises — and because the records are dynamic and timestamped, ordinary scavenging cleans up anything stale. No delete logic is needed at all.
+
+**Load shape.** The server-side script batches its work. A morning ramp in which several hundred hosts connect within one interval becomes that many DNS operations issued back-to-back against a single server — and each *changed* record costs two, since an update is a remove followed by an add. Any run with at least one change also enumerates every A record in the zone, a cost that scales with zone size rather than with how much actually changed. The client-side script does one update per machine at the moment that machine connects, which is the same load pattern a traditional VPN client already produces.
+
+**`MaxDeletesPerRun` does not scale.** The cap is all-or-nothing: if a single run queues more deletes than the cap, *every* delete is skipped and the hosts are carried forward in the state cache. Because those hosts remain absent from the ZPA response, the next run queues the same set and trips again — it does not self-heal. End-of-day disconnects in a large environment will routinely exceed any cap low enough to still be a useful guard against a truncated API reply. **If your peak disconnects per interval will regularly exceed `MaxDeletesPerRun`, the server-side delete path is not viable for you** — and without deletes you are back to the ownership problem above. That threshold is the clearest signal that you have outgrown the server-side approach.
+
+Before rolling out client-side, confirm that clients can reach a domain controller through the tunnel for **both** DNS (53) and Kerberos (88) — secure dynamic update uses GSS-TSIG, so name resolution alone is not enough. Publish the DC as a ZPA application segment. Also accept that observability becomes distributed: one log per endpoint instead of one overall, with failures that are correspondingly quieter.
+
+### Prefer server-side in smaller environments
+
+Everything that makes the client-side approach scale well also makes it harder to reason about. The server-side script has one log, one config file, and one place to look when something is wrong. You can run it by hand on demand, watch the whole reconciliation happen, and see exactly what it decided and why. It requires no endpoint footprint, no GPO, and no client→DC path, and the ZPA API remains an authoritative central view of what should be registered.
+
+At a few hundred concurrent users the batching costs above are not worth worrying about, and the delete cap comfortably covers realistic disconnect volumes. That is a good trade.
+
+### Running both
+
+Not recommended. The server-side script overwrites records unconditionally, including ones it does not own, and the records it writes are static. Pointing both mechanisms at the same zone means the server-side run converts each client's dynamic, self-owned record into a static one — reintroducing exactly the ownership problem the client-side script exists to avoid. If you must run both during a migration, have them write to different zones, and cut over rather than overlapping.
+
 ## Requirements
 
-- PowerShell 5.1 or later
+PowerShell 5.1 or later, for either approach.
+
+**Server-side (`zpa-dns-sync-oneapi.ps1`) additionally needs:**
+
 - `DnsServer` module — included on Windows Server with the DNS role, or installable via RSAT on a domain member: `Add-WindowsCapability -Online -Name Rsat.Dns.Tools~~~~0.0.1.0` for Desktops and `Install-WindowsFeature -Name RSAT-DNS-Server` on Server platforms
 - A service account with full CRUD delegation on the target DNS zone (not Domain Admin — standard DNS zone permissions are sufficient)
 - OneAPI credentials with read access ZPA API resources
+
+**Client-side (`ZVPN-ConProf.ps1`) additionally needs:**
+
+- A zone that accepts secure dynamic updates
+- A domain controller reachable through the tunnel on both DNS (53) and Kerberos (88), published as a ZPA application segment
+- GPO to deploy the script and its scheduled task to clients
 
 ## Setup - DNS Sync
 
@@ -65,7 +118,7 @@ Settings can be provided two ways — the config file takes precedence over the 
 | `$SyncDeletes` | Remove A records for hosts that are no longer VPN connected (default: `false` — see [Deleting records](#deleting-records)) |
 | `$MaxDeletesPerRun` | Refuse to run if a single pass would delete more than this many records (default: `50`, `0` disables the cap) |
 
-## How it works
+## How it works - server-side sync
 
 1. Authenticates to `https://<VanityDomain>.zslogin.net/oauth2/v1/token` using the OAuth2 `client_credentials` flow
 2. Pages through `GET /zpa/mgmtconfig/v1/admin/customers/:customerId/vpnConnectedUsers` until all connected users are retrieved
@@ -90,6 +143,8 @@ The match test on delete exists because a mismatch means something more current 
 `MaxDeletesPerRun` is a blast-radius guard. Because the delete set is derived from the *absence* of hosts in the API response, a transient empty or truncated ZPA reply would otherwise queue every managed record for deletion. If a run exceeds the cap, all deletes are skipped, an `[ERROR]` is logged, and the affected hosts stay in the state cache so a later healthy run can still clean them up.
 
 Enable deletes only once you have run with them off long enough to trust the state cache, and check the log for the first few runs.
+
+> **Scale limit.** "A later healthy run" assumes the overage was transient. It is not, if the cause is simply how many people disconnected — those hosts stay absent from the API response, so the next run queues the same set and trips the cap again. Size `MaxDeletesPerRun` above your realistic peak disconnects per interval, and if that number is too large to still function as a guard, use the client-side script instead. See [Choosing an approach](#choosing-an-approach).
 
 ## Logs
 
@@ -154,7 +209,7 @@ Start PowerShell with **Run as administrator** to test manually. If you see the 
 
 Note that a non-elevated run can still *look* like it partly worked: the reclassification job logs `already classified Private - no change` without attempting a write, so it never hits the permission error.
 
-## How it works
+## How it works - client-side registration
 
 1. Group Policy Object deploys the script to each client machine and creates the scheduled task.
 2. Scheduled Task triggers on Event ID 10000 in the Microsoft-Windows-NetworkProfile/Operational log, with source NetworkProfile.
@@ -187,7 +242,7 @@ Step 5 always runs, including when an earlier step throws — leaving an interna
 
 `$DnsServerAddress` must be reachable through the tunnel — publish it as a ZPA application segment, or the update never leaves the machine.
 
-**Why register client-side at all.** Records written by `zpa-dns-sync-oneapi.ps1` are static and owned by its service account, which is what blocks an on-prem client from updating them (see [Deleting records](#deleting-records)). A record the client registers itself is owned by the computer account, so the machine can update it on its own when it returns on-net. If you run both mechanisms, point `$DnsSuffix` at the same zone as the server script's `$DnsZone`.
+**Why register client-side at all.** Records written by `zpa-dns-sync-oneapi.ps1` are static and owned by its service account, which is what blocks an on-prem client from updating them (see [Deleting records](#deleting-records)). A record the client registers itself is owned by the computer account, so the machine can update it on its own when it returns on-net. That, plus a write pattern that spreads naturally across the day, is why this is the recommended approach at scale — see [Choosing an approach](#choosing-an-approach), including why running both mechanisms against one zone defeats the purpose.
 
 **Known limitations.**
 
