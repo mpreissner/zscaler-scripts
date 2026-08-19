@@ -5,7 +5,9 @@
 # jobs, each separately switchable:
 #
 #   1. Reclassify the "Zscaler Tunnel" adapter as a Private network so Windows
-#      Firewall stops dropping inbound connections over the tunnel.
+#      Firewall stops dropping inbound connections over the tunnel. An adapter
+#      Windows already classified DomainAuthenticated is left alone - it is
+#      equally permissive, and it cannot be changed by script anyway.
 #   2. Register the adapter's tunnel IP in AD DNS using Windows' own dynamic
 #      update mechanism, so the record is owned by the computer account and the
 #      machine can update it itself when it returns on-prem. The last
@@ -109,6 +111,19 @@ $MaxLogSizeBytes = 1MB
 # instead of keeping a copy.
 $LogRetainedFiles = 1
 
+# --- Debug logging --------------------------------------------------------
+# Adds [DEBUG] entries describing what the machine actually looked like at each
+# step: adapter and DNS client state, which interface traffic to the DNS server
+# would leave by, whether 53 and 88 are reachable, the zone's SOA, every
+# verification lookup, and any DNS Client events Windows itself logged during
+# the run. That is most of what is needed to explain a failed registration
+# without going back to the endpoint.
+#
+# Off by default - it multiplies a run's output several times over, which the
+# rotation settings above then have to absorb. Turn it on while investigating,
+# turn it off afterwards.
+$DebugLogging = $false
+
 # =============================================================================
 # CONFIG FILE (optional) - overrides the defaults above
 #
@@ -166,6 +181,7 @@ foreach ($_cfgPath in $_cfgCandidates) {
         if ($_p['LogFile'])                       { $LogFile                       = [string]$cfg.LogFile }
         if ($_p['MaxLogSizeBytes'])               { $MaxLogSizeBytes               = [long]$cfg.MaxLogSizeBytes }
         if ($_p['LogRetainedFiles'])              { $LogRetainedFiles              = [int]$cfg.LogRetainedFiles }
+        if ($_p['DebugLogging'])                  { $DebugLogging                  = ConvertTo-ConfigBool $cfg.DebugLogging }
 
         $ConfigLoadedFrom = $_cfgPath
     }
@@ -259,7 +275,7 @@ function Invoke-LogRotation {
 function Write-Log {
     param(
         [Parameter(Mandatory)][string]$Message,
-        [ValidateSet("INFO","WARN","ERROR")][string]$Level = "INFO"
+        [ValidateSet("INFO","WARN","ERROR","DEBUG")][string]$Level = "INFO"
     )
     $entry = New-LogEntry $Message $Level
     Write-Host $entry
@@ -289,6 +305,180 @@ function Write-Log {
     }
     catch {
         Write-Host "[WARN] Could not write to log file: $_"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Debug logging
+# ---------------------------------------------------------------------------
+# Every run stamps its own start time so the DNS Client event probe below can
+# ask for "events from this run" rather than trawling the whole System log.
+$ScriptStartTime = Get-Date
+
+function Write-DebugLog {
+    param([Parameter(Mandatory)][string]$Message)
+    if (-not $DebugLogging) { return }
+    Write-Log $Message "DEBUG"
+}
+
+# Runs one diagnostic and logs whatever it produced, one indented line per
+# result. Diagnostics are never load-bearing - a cmdlet missing on this host, an
+# adapter that disappeared mid-run, or a probe that simply times out must not
+# take the run down with it - so the failure is contained here and reported as
+# part of the debug output.
+function Write-DebugProbe {
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)][scriptblock]$Probe
+    )
+    if (-not $DebugLogging) { return }
+
+    try {
+        $lines = @(& $Probe | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+        if ($lines.Count -eq 0) {
+            Write-DebugLog "${Label}: (no data)"
+            return
+        }
+        Write-DebugLog "${Label}:"
+        foreach ($line in $lines) { Write-DebugLog "    $line" }
+    }
+    catch {
+        # Flattened: a multi-line cmdlet error would otherwise put untimestamped
+        # continuation lines in the middle of the log.
+        Write-DebugLog "${Label}: could not be collected: $(([string]$_ -replace '\s+', ' ').Trim())"
+    }
+}
+
+# Who and what is running - the first thing to check when a run behaves
+# differently on one machine than on the bench.
+function Write-EnvironmentDebug {
+    if (-not $DebugLogging) { return }
+
+    Write-DebugProbe "Host" {
+        $os     = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+        $osText = if ($os) { "$($os.Caption) build $($os.BuildNumber)" } else { "unknown" }
+        $ipProps = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties()
+
+        "Computer=$env:COMPUTERNAME RunningAs=$([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+        "PowerShell=$($PSVersionTable.PSVersion) OS=$osText"
+        "PrimaryDnsSuffix='$($ipProps.DomainName)'"
+    }
+}
+
+# State of the tunnel adapter itself. $Stage names the point in the run, so a
+# log read after the fact shows what each step actually changed.
+function Write-AdapterDebug {
+    param([Parameter(Mandatory)][string]$Stage)
+    if (-not $DebugLogging) { return }
+
+    Write-DebugProbe "Adapter '$TargetAlias' [$Stage]" {
+        Get-NetAdapter -Name $TargetAlias -ErrorAction SilentlyContinue | ForEach-Object {
+            "Status=$($_.Status) ifIndex=$($_.InterfaceIndex) Description='$($_.InterfaceDescription)'"
+        }
+        Get-NetIPAddress -InterfaceAlias $TargetAlias -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object {
+            "IPv4 $($_.IPAddress)/$($_.PrefixLength) State=$($_.AddressState) Origin=$($_.PrefixOrigin)/$($_.SuffixOrigin)"
+        }
+        Get-NetIPInterface -InterfaceAlias $TargetAlias -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object {
+            "InterfaceMetric=$($_.InterfaceMetric) AutomaticMetric=$($_.AutomaticMetric) Dhcp=$($_.Dhcp) ConnectionState=$($_.ConnectionState)"
+        }
+        Get-DnsClientServerAddress -InterfaceAlias $TargetAlias -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.ServerAddresses) { "DnsServers=$($_.ServerAddresses -join ', ')" } else { "DnsServers=(none)" }
+        }
+        Get-DnsClient -InterfaceAlias $TargetAlias -ErrorAction SilentlyContinue | ForEach-Object {
+            "ConnectionSpecificSuffix='$($_.ConnectionSpecificSuffix)' " +
+            "RegisterThisConnectionsAddress=$($_.RegisterThisConnectionsAddress) " +
+            "UseSuffixWhenRegistering=$($_.UseSuffixWhenRegistering)"
+        }
+    }
+}
+
+# Why an update might not be reaching the DNS server. Register-DnsClient is
+# machine-wide and the resolver picks a server by interface metric, so the
+# question is never just "is the DNS server up" - it is which interface the
+# traffic leaves by, and whether the machine can do Kerberos to it as well.
+function Write-DnsPathDebug {
+    param([string]$Fqdn)
+    if (-not $DebugLogging) { return }
+
+    Write-DebugProbe "DNS servers on all interfaces" {
+        Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.ServerAddresses } |
+            ForEach-Object { "$($_.InterfaceAlias) (metric-ordered by the resolver): $($_.ServerAddresses -join ', ')" }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($DnsServerAddress)) { return }
+
+    # The single most useful line in a failed run: if the source address is the
+    # home NIC rather than the tunnel, the update never entered the tunnel and
+    # nothing on the DNS side is at fault.
+    Write-DebugProbe "Route to $DnsServerAddress" {
+        Find-NetRoute -RemoteIPAddress $DnsServerAddress -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSObject.Properties['IPAddress'] } |
+            ForEach-Object { "source $($_.IPAddress) via '$($_.InterfaceAlias)' (ifIndex $($_.InterfaceIndex))" }
+    }
+
+    # Secure dynamic update is GSS-TSIG, so the update needs Kerberos to the
+    # domain controller as well as DNS itself. A machine that resolves names
+    # perfectly but cannot reach 88 fails the update with nothing obviously
+    # wrong on the DNS side.
+    foreach ($port in 53, 88) {
+        Write-DebugProbe "TCP $port to $DnsServerAddress" {
+            $reachable = Test-NetConnection -ComputerName $DnsServerAddress -Port $port `
+                             -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
+            if ($reachable) { "reachable" } else { "NOT reachable - the update cannot complete" }
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Fqdn)) { return }
+
+    # The client looks up the SOA to find the zone's primary before it sends the
+    # update, so a failure here is a failure of the whole registration.
+    $zone = $Fqdn.Substring($Fqdn.IndexOf('.') + 1)
+    Write-DebugProbe "SOA for '$zone' from $DnsServerAddress" {
+        Resolve-DnsName -Name $zone -Type SOA -Server $DnsServerAddress -DnsOnly -NoHostsFile -ErrorAction Stop |
+            ForEach-Object {
+                $primary = if ($_.PSObject.Properties['PrimaryServer']) { $_.PrimaryServer } else { "" }
+                "$($_.Name) $($_.Type) $primary"
+            }
+    }
+
+    Write-DebugProbe "Current A records for $Fqdn on $DnsServerAddress" {
+        Resolve-DnsName -Name $Fqdn -Type A -Server $DnsServerAddress -DnsOnly -NoHostsFile -ErrorAction Stop |
+            Where-Object { $_.Type -eq 'A' } |
+            ForEach-Object { "$($_.Name) -> $($_.IPAddress) (TTL $($_.TTL))" }
+    }
+}
+
+# Register-DnsClient returns success as soon as the DNS Client service accepts
+# the request and never reports what happened next. The service does, in the
+# System log - event 8018 and its neighbours carry the actual reason (server
+# refused the update, no domain controller, timeout).
+function Write-DnsClientEventDebug {
+    param([Parameter(Mandatory)][datetime]$Since)
+    if (-not $DebugLogging) { return }
+
+    Write-DebugProbe "DNS Client events since $($Since.ToString('HH:mm:ss'))" {
+        # Queried one provider at a time on purpose. The registration events
+        # moved provider across Windows versions, and naming one that does not
+        # write to the System log on this host fails the whole query rather than
+        # being ignored - which would cost the events from the one that does.
+        $events = @()
+        foreach ($provider in 'Microsoft-Windows-DNS-Client', 'DnsApi') {
+            try {
+                $events += Get-WinEvent -FilterHashtable @{
+                                LogName      = 'System'
+                                ProviderName = $provider
+                                StartTime    = $Since
+                            } -MaxEvents 20 -ErrorAction SilentlyContinue
+            }
+            catch { }
+        }
+
+        $events | Sort-Object TimeCreated | ForEach-Object {
+            $text = ([string]$_.Message -replace '\s+', ' ').Trim()
+            if ($text.Length -gt 400) { $text = $text.Substring(0, 400) + "..." }
+            "[$($_.TimeCreated.ToString('HH:mm:ss'))] $($_.LevelDisplayName) id=$($_.Id) $text"
+        }
     }
 }
 
@@ -339,7 +529,20 @@ function Wait-ForTunnelAddress {
 # ---------------------------------------------------------------------------
 # Job 1 - network category
 # ---------------------------------------------------------------------------
-function Set-TunnelProfilePrivate {
+# Windows has three categories and two of them already give this job what it
+# exists to achieve: Private and DomainAuthenticated both put the adapter on a
+# firewall profile permissive enough for the inbound traffic the tunnel carries.
+# Only Public needs fixing.
+#
+# DomainAuthenticated in particular must be left alone rather than treated as
+# wrong. It is assigned by NLA when it can authenticate a domain controller over
+# the adapter - which does happen on the tunnel - and it cannot be set back by
+# script in any case: Set-NetConnectionProfile -NetworkCategory accepts Public
+# and Private only. Trying would log an error on every single run that nothing
+# could ever clear.
+$AcceptableNetworkCategories = @("Private", "DomainAuthenticated")
+
+function Set-TunnelProfileCategory {
     $profiles = Get-NetConnectionProfile -ErrorAction SilentlyContinue |
                     Where-Object { $_.InterfaceAlias -eq $TargetAlias }
 
@@ -349,12 +552,21 @@ function Set-TunnelProfilePrivate {
     }
 
     foreach ($connectprofile in $profiles) {
-        if ($connectprofile.NetworkCategory -eq "Private") {
-            Write-Log "'$TargetAlias' already classified Private - no change"
+        # Compared as a string: NetworkCategory is an enum, and the acceptable
+        # list has to stay readable in the log line below either way.
+        $category = [string]$connectprofile.NetworkCategory
+
+        Write-DebugLog ("Profile '$($connectprofile.Name)' on '$($connectprofile.InterfaceAlias)': " +
+                        "NetworkCategory=$category IPv4Connectivity=$($connectprofile.IPv4Connectivity) " +
+                        "IPv6Connectivity=$($connectprofile.IPv6Connectivity)")
+
+        if ($AcceptableNetworkCategories -contains $category) {
+            Write-Log "'$TargetAlias' is classified $category - no change needed"
             continue
         }
+
         try {
-            Write-Log "Reclassifying '$TargetAlias' from $($connectprofile.NetworkCategory) to Private"
+            Write-Log "Reclassifying '$TargetAlias' from $category to Private"
             Set-NetConnectionProfile -InterfaceAlias $connectprofile.InterfaceAlias -NetworkCategory Private
         }
         catch {
@@ -377,7 +589,9 @@ function Get-RegistrationFqdn {
 function Test-RegistrationLanded {
     param([string]$Fqdn, [string]$ExpectedIp)
     $deadline = (Get-Date).AddSeconds($VerifyTimeoutSeconds)
+    $attempt  = 0
     while ($true) {
+        $attempt++
         try {
             $answers = Resolve-DnsName -Name $Fqdn -Type A -Server $DnsServerAddress `
                            -DnsOnly -NoHostsFile -ErrorAction SilentlyContinue
@@ -390,10 +604,20 @@ function Test-RegistrationLanded {
                 if ($ips.Count -gt 0) {
                     Write-Log "  $Fqdn currently $($ips -join ', ') - waiting for $ExpectedIp"
                 }
+                else {
+                    # An answer with no A record in it - usually a CNAME or the
+                    # SOA of a zone that exists but holds no such name.
+                    Write-DebugLog ("  Attempt ${attempt}: answer carried no A record " +
+                                    "(types: $(($answers | ForEach-Object { $_.Type }) -join ', '))")
+                }
+            }
+            else {
+                Write-DebugLog "  Attempt ${attempt}: no answer for $Fqdn from $DnsServerAddress yet"
             }
         }
         catch {
             Write-Log "  Verification lookup failed: $_" "WARN"
+            Write-DebugLog "  Attempt ${attempt}: $($_.Exception.GetType().Name) - $($_.Exception.Message)"
         }
         if ((Get-Date) -ge $deadline) { return $false }
         Start-Sleep -Seconds $PollIntervalSeconds
@@ -430,6 +654,9 @@ function Get-RegistrationState {
             $lastRegistered = [datetime]::Parse([string]$stamp, [cultureinfo]::InvariantCulture,
                                   [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
         }
+
+        Write-DebugLog ("State file '$StateFile': Fqdn=$($raw.Fqdn) IPAddress=$($raw.IPAddress) " +
+                        "LastRegistered=$($lastRegistered.ToString('o'))")
 
         return [pscustomobject]@{
             IPAddress      = [string]$raw.IPAddress
@@ -525,6 +752,11 @@ function Register-TunnelAddress {
 
     Write-Log "Registering $fqdn -> $IPAddress via $DnsServerAddress"
 
+    # Collected before anything is changed, so a failed run shows the state the
+    # registration was attempted from rather than the state it was left in.
+    Write-AdapterDebug "before registration"
+    Write-DnsPathDebug -Fqdn $fqdn
+
     # Only reset an address that was actually applied. If the apply itself
     # failed there is nothing pinned to the adapter, and resetting anyway just
     # fails a second time and buries the real error under a follow-on one.
@@ -553,6 +785,12 @@ function Register-TunnelAddress {
             Set-DnsClient -InterfaceAlias $TargetAlias -RegisterThisConnectionsAddress $true
         }
 
+        Write-AdapterDebug "DNS server applied"
+
+        # Only events from here on describe this registration attempt - anything
+        # earlier belongs to whatever the DNS Client service was doing before.
+        $submittedAt = Get-Date
+
         Register-DnsClient
         Write-Log "  Registration submitted"
 
@@ -565,6 +803,9 @@ function Register-TunnelAddress {
             }
             else {
                 Write-Log "Registration not visible on $DnsServerAddress after ${VerifyTimeoutSeconds}s. Check that the DNS server is reachable through the tunnel and that the zone accepts secure dynamic updates." "WARN"
+                if (-not $DebugLogging) {
+                    Write-Log "  Set DebugLogging to true in the config file and reproduce for the detail behind this." "WARN"
+                }
             }
         }
         else {
@@ -573,9 +814,15 @@ function Register-TunnelAddress {
             # without error" is the strongest signal available.
             $registered = $true
         }
+
+        # After verification either way: the service writes its result some time
+        # after Register-DnsClient returns, so asking earlier finds nothing.
+        Write-DnsClientEventDebug -Since $submittedAt
     }
     catch {
         Write-Log "Dynamic DNS registration failed: $_" "ERROR"
+        Write-DebugLog "  $($_.Exception.GetType().Name) at $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.Message)"
+        Write-DnsClientEventDebug -Since $ScriptStartTime
     }
     finally {
         # Always hand the adapter back once it was taken, even on failure -
@@ -610,8 +857,10 @@ else                        { Write-Log "No config file found - using in-script 
 Write-Log ("Settings: Reclassify=$EnableProfileReclassification DnsRegistration=$EnableDnsRegistration " +
            "DnsServer='$DnsServerAddress' DnsSuffix='$DnsSuffix' AdapterTimeout=${AdapterTimeoutSeconds}s " +
            "Poll=${PollIntervalSeconds}s Verify=$VerifyRegistration Timeout=${VerifyTimeoutSeconds}s " +
-           "MaxLogSize=${MaxLogSizeBytes}B LogRetained=$LogRetainedFiles " +
+           "MaxLogSize=${MaxLogSizeBytes}B LogRetained=$LogRetainedFiles Debug=$DebugLogging " +
            "StateFile='$StateFile' ForceRegisterAfter=${ForceRegisterAfterHours}h")
+
+Write-EnvironmentDebug
 
 try {
     # Inside the try so an unexpected failure in the check itself still gets
@@ -629,8 +878,9 @@ try {
         exit 0
     }
     Write-Log "Adapter '$TargetAlias' has address $tunnelIp"
+    Write-AdapterDebug "adapter ready"
 
-    if ($EnableProfileReclassification) { Set-TunnelProfilePrivate }
+    if ($EnableProfileReclassification) { Set-TunnelProfileCategory }
     else { Write-Log "Profile reclassification disabled - skipping" }
 
     if ($EnableDnsRegistration) { Register-TunnelAddress -IPAddress $tunnelIp }

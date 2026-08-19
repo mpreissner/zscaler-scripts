@@ -19,7 +19,7 @@ Tom O'Leary, Mike Preissner
 |------|---------|
 | `zpa-dns-sync-oneapi.ps1` | Core sync script. Authenticates to ZPA via OneAPI (OAuth2 client_credentials), fetches all connected VPN users with pagination, and adds or updates A records in the target AD DNS zone. A local state cache avoids redundant DNS operations for entries that haven't changed. |
 | `zpa-dns-sync.config.json.example` | Template for the optional external config file — copy to `zpa-dns-sync.config.json` alongside the script and fill in your values. |
-| `ZVPN-ConProf.ps1` | Client-side script, GPO-deployed. Reclassifies the "Zscaler Tunnel" adapter as a Private network interface for a less restrictive host firewall, and optionally registers the tunnel IP in AD DNS using Windows' built-in dynamic update. A local state file limits registrations to runs where the address actually changed, and the activity log is size-capped and rotated. |
+| `ZVPN-ConProf.ps1` | Client-side script, GPO-deployed. Reclassifies the "Zscaler Tunnel" adapter as a Private network interface for a less restrictive host firewall (leaving it alone if Windows already classified it `DomainAuthenticated`), and optionally registers the tunnel IP in AD DNS using Windows' built-in dynamic update. A local state file limits registrations to runs where the address actually changed, and the activity log is size-capped and rotated. |
 | `zvpn-conprof.config.json.example` | Template for the optional external config file used by `ZVPN-ConProf.ps1` — copy to `zvpn-conprof.config.json` alongside the script and fill in your values. |
 | `ZVPN-SchedTaskConfig.txt` | Instructions for deploying a Scheduled Task via Group Policy Objects to run ZVPN-ConProf.ps1 on detection of Zscaler Tunnel Up in Windows Event Log. |
 
@@ -156,7 +156,7 @@ Activity is written to `$LogFile` and echoed to stdout. Each entry is timestampe
 
 | Job | Setting | Default |
 |-----|---------|---------|
-| Reclassify the tunnel adapter as a Private network | `$EnableProfileReclassification` | `$true` |
+| Reclassify the tunnel adapter as a Private network, if it is currently Public | `$EnableProfileReclassification` | `$true` |
 | Register the tunnel IP in AD DNS via Windows dynamic update | `$EnableDnsRegistration` | `$false` |
 
 1. Copy `zvpn-conprof.config.json.example` to `zvpn-conprof.config.json` and set your values (see [Client configuration](#client-configuration) below) — at minimum `DnsServerAddress` and `DnsSuffix` if you are enabling DNS registration. Alternatively, edit the **USER CONFIGURATION** block at the top of `ZVPN-ConProf.ps1`.
@@ -179,7 +179,7 @@ Config keys and the script variables they override are named identically, minus 
 | Variable / JSON key | Description |
 |----------|-------------|
 | `$TargetAlias` | Interface alias of the VPN adapter (default: `Zscaler Tunnel`) |
-| `$EnableProfileReclassification` | Flip the adapter's network category to Private (default: `true`) |
+| `$EnableProfileReclassification` | Flip the adapter's network category to Private when it is Public (default: `true`). `Private` and `DomainAuthenticated` are both left as they are |
 | `$EnableDnsRegistration` | Register the tunnel IP in AD DNS (default: `false`) |
 | `$DnsServerAddress` | Internal DNS server that will accept the dynamic update — **required** when DNS registration is enabled |
 | `$DnsSuffix` | Connection-specific suffix to register under. Empty = the machine's primary domain suffix |
@@ -193,6 +193,7 @@ Config keys and the script variables they override are named identically, minus 
 | `$LogFile` | Activity log (default: `C:\ProgramData\zpa-vpn-sync\zvpn-conprof.log`) |
 | `$MaxLogSizeBytes` | Rotate the log once it reaches this size (default: `1048576`, i.e. 1 MB). `0` disables rotation |
 | `$LogRetainedFiles` | Rotated copies to keep (default: `1`). `0` discards the old log instead of keeping a copy |
+| `$DebugLogging` | Add `[DEBUG]` entries with the detail behind a failed run (default: `false`) — see [Debug logging](#debug-logging) |
 
 In JSON, write booleans unquoted (`true`, not `"true"`) and escape backslashes in Windows paths (`"C:\\ProgramData\\..."`).
 
@@ -207,15 +208,31 @@ Both jobs are CIM calls that require administrator rights. The GPO scheduled tas
 
 Start PowerShell with **Run as administrator** to test manually. If you see the raw `Access to a CIM resource was not available to the client` error from `Set-NetConnectionProfile` or `Set-DnsClientServerAddress` instead, that is the same cause.
 
-Note that a non-elevated run can still *look* like it partly worked: the reclassification job logs `already classified Private - no change` without attempting a write, so it never hits the permission error.
+Note that a non-elevated run can still *look* like it partly worked: when the adapter is already in an acceptable category the reclassification job logs `is classified Private - no change needed` without attempting a write, so it never hits the permission error.
 
 ## How it works - client-side registration
 
 1. Group Policy Object deploys the script to each client machine and creates the scheduled task.
 2. Scheduled Task triggers on Event ID 10000 in the Microsoft-Windows-NetworkProfile/Operational log, with source NetworkProfile.
 3. The script waits for the "Zscaler Tunnel" adapter to hold a usable IPv4 address. Event 10000 fires when the network profile is evaluated, which can beat the adapter actually being addressable, so it polls rather than assumes. APIPA (`169.254.x.x`) and non-`Preferred` addresses do not count.
-4. It checks the network profile assigned to the interface and changes it to Private if necessary.
+4. It checks the network category assigned to the interface and changes it to Private only if it is `Public` (see [Network category](#network-category)).
 5. If DNS registration is enabled, it registers the tunnel address — but only if that address (or the name it registers under) has changed since the last run (see below).
+
+### Network category
+
+The point of this job is the host firewall: an adapter Windows has categorised as `Public` gets the Public firewall profile, which drops the inbound connections the tunnel exists to carry. Two of the three categories are already fine:
+
+| Category | Firewall profile | Action |
+|----------|------------------|--------|
+| `Public` | Public — restrictive | Reclassified to `Private` |
+| `Private` | Private | Left alone |
+| `DomainAuthenticated` | Domain | Left alone |
+
+`DomainAuthenticated` is assigned by the Network Location Awareness service when it can authenticate a domain controller over the adapter, which does happen on the tunnel. It is equally permissive for our purposes, and it cannot be changed by script in any case — `Set-NetConnectionProfile -NetworkCategory` accepts `Public` and `Private` only. Treating it as a problem would mean an error in the log on every run that nothing could ever clear, so the script reports the category and moves on:
+
+```
+[INFO] 'Zscaler Tunnel' is classified DomainAuthenticated - no change needed
+```
 
 ### Dynamic DNS registration
 
@@ -248,3 +265,21 @@ Step 5 always runs, including when an earlier step throws — leaving an interna
 
 - `Register-DnsClient` is machine-wide. It triggers registration for every adapter with registration enabled, not just the tunnel. There is no per-adapter variant.
 - Because the DNS server is removed from the adapter afterwards, Windows' periodic background re-registration (roughly every 24h) again has no route to the internal DNS server. A long-lived tunnel session could therefore see the record scavenged before the script next runs.
+
+### Debug logging
+
+Set `DebugLogging` to `true` in the config file (or `$DebugLogging = $true` in the script) to add `[DEBUG]` entries to the same log. It is aimed at a registration that fails or silently does nothing, and it collects, per run:
+
+- **Host** — computer name, the identity the run is under, PowerShell and OS version, primary DNS suffix.
+- **Adapter state**, captured at each stage (`adapter ready`, `before registration`, `DNS server applied`) — link status, all IPv4 addresses with their address state, interface metric, the DNS servers currently on the adapter, and the connection-specific suffix plus the `RegisterThisConnectionsAddress` / `UseSuffixWhenRegistering` flags.
+- **DNS servers on every interface** — `Register-DnsClient` is machine-wide and the resolver picks a server by interface metric, so what is on the *other* adapters matters.
+- **Route to `$DnsServerAddress`** — which interface and source address traffic to the DNS server would actually use. If that is the home NIC rather than the tunnel, the update never entered the tunnel and nothing on the DNS side is at fault.
+- **TCP 53 and TCP 88 reachability** — secure dynamic update is GSS-TSIG, so it needs Kerberos to the domain controller as well as DNS. A machine that resolves names perfectly but cannot reach 88 fails the update with nothing obviously wrong on the DNS side.
+- **The zone's SOA and the name's current A records**, as seen from `$DnsServerAddress` — the client looks the SOA up to find the zone's primary before it sends anything, so a failure there fails the whole registration.
+- **Every verification lookup**, including the attempts that came back empty and the exception behind any lookup error.
+- **DNS Client events from the System log**, filtered to the window after the update was submitted. `Register-DnsClient` returns as soon as the DNS Client service accepts the request and never reports what happened next — the service does, under event 8018 and its neighbours, with the actual reason (server refused the update, no domain controller, timeout).
+- **The state file's contents**, so a run that skipped registration shows what it compared against.
+
+Diagnostics are never load-bearing: each probe runs inside its own error handler, so a cmdlet missing on the host or an adapter that disappears mid-run is reported as `could not be collected` rather than failing the run.
+
+Leave it off in steady state. A debug run writes several times as many lines as a normal one and spends a few extra seconds on the reachability probes, and the trigger fires on every network profile evaluation — `$MaxLogSizeBytes` and `$LogRetainedFiles` still cap the file, but the rotation window gets correspondingly shorter.

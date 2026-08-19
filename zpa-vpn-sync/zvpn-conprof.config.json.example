@@ -13,5 +13,6 @@
     "PostRegisterDelaySeconds":      5,
     "LogFile":                       "C:\\ProgramData\\zpa-vpn-sync\\zvpn-conprof.log",
     "MaxLogSizeBytes":               1048576,
-    "LogRetainedFiles":              1
+    "LogRetainedFiles":              1,
+    "DebugLogging":                  false
 }
