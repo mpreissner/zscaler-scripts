@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # ZVPN-ConProf.ps1
 #
 # Runs on the client when the Zscaler Tunnel adapter comes up. Two independent
@@ -21,6 +21,20 @@
 # require elevation.
 # =============================================================================
 
+
+# =============================================================================
+# FOLDER HARDENING
+#
+# Lock down working directories for security.
+# =============================================================================
+
+$path = "C:\ProgramData\zpa-vpn-sync"
+if (-not (Test-Path $path)) {
+    New-Item -ItemType Directory -Path $path -Force
+    icacls $path /inheritance:r
+    icacls $path /grant:r "SYSTEM:(OI)(CI)(F)"
+    icacls $path /grant:r "Administrators:(OI)(CI)(F)"
+}
 
 # =============================================================================
 # USER CONFIGURATION
